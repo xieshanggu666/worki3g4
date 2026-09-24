@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
 from .. import service
+from .. import coop as coop_mod
 from ..schemas import ActRequest, CreateRunRequest
 
 router = APIRouter(prefix="/api/runs", tags=["run"])
@@ -28,6 +29,9 @@ def get_run(run_id: str):
 def act(run_id: str, body: ActRequest):
     try:
         return service.act(run_id, body.model_dump())
+    except (coop_mod.CoopAuthError, coop_mod.CoopPermissionError) as e:
+        # 多人协作远征：令牌错误/角色越权 -> 403（校验先于任何变更，零副作用）
+        raise HTTPException(status_code=403, detail=str(e))
     except service.DuplicateReward as e:
         # 重复领奖/重复锻造：业务幂等键拦截（含并发情况下后到的请求）
         raise HTTPException(status_code=409, detail=str(e))

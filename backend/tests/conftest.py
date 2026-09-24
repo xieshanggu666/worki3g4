@@ -25,6 +25,9 @@ def reset_db():
         conn.execute("DELETE FROM expeditions")
         conn.execute("DELETE FROM expedition_events")
         conn.execute("DELETE FROM act_requests")
+        conn.execute("DELETE FROM coop_parties")
+        conn.execute("DELETE FROM coop_members")
+        conn.execute("DELETE FROM coop_events")
         conn.commit()
     finally:
         conn.close()
@@ -37,6 +40,9 @@ def reset_db():
         conn.execute("DELETE FROM expeditions")
         conn.execute("DELETE FROM expedition_events")
         conn.execute("DELETE FROM act_requests")
+        conn.execute("DELETE FROM coop_parties")
+        conn.execute("DELETE FROM coop_members")
+        conn.execute("DELETE FROM coop_events")
         conn.commit()
     finally:
         conn.close()

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { api } from './api'
+import { api, setCoopMember } from './api'
 import { useStore } from './store'
 import MapView from './components/MapView.jsx'
 import BattleView from './components/BattleView.jsx'
@@ -14,6 +14,9 @@ import EncounterView from './components/EncounterView.jsx'
 import EncounterFlags from './components/EncounterFlags.jsx'
 import ReplayPlayer from './components/ReplayPlayer.jsx'
 import ExpeditionReplay from './components/ExpeditionReplay.jsx'
+import CoopLobby from './components/CoopLobby.jsx'
+import CoopRoster from './components/CoopRoster.jsx'
+import CoopReplay from './components/CoopReplay.jsx'
 
 export default function App() {
   const { view, setCards, cards, runId, setRunId, applyRun } = useStore()
@@ -29,6 +32,45 @@ export default function App() {
   const [replayId, setReplayId] = useState(null)
   // 远征整程回放：expReplayId 非 null 时覆盖全屏（逐章切换，同样只读隔离）
   const [expReplayId, setExpReplayId] = useState(null)
+  // 多人协作：本地保存的成员身份（member_id/token），有协作远征进行时显示续征入口
+  const [coopMe] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('cardrun.coop.me') || 'null')
+    } catch (_) {
+      return null
+    }
+  })
+  const [coopPartyId, setCoopPartyId] = useState(null)
+  const [coopReplayId, setCoopReplayId] = useState(null)
+
+  // 协作远征进行中（上次会话）：直接挂载凭据并续征
+  async function resumeCoopExpedition() {
+    if (!coopMe?.expedition_id) return
+    setLoading(true); setErr('')
+    try {
+      setCoopMember(coopMe)
+      const data = await api.getExpedition(coopMe.expedition_id)
+      applyRun(data.run)
+      setRunId(data.run.run_id)
+      setCoopPartyId(coopMe.party_id)
+      setCoopReplayId(coopMe.party_id)
+      setReplayId(null)
+    } catch (e) {
+      setErr(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function onCoopStarted(data, stored) {
+    setCoopMember(stored)
+    applyRun(data.run)
+    setRunId(data.run.run_id)
+    setCoopPartyId(stored.party_id)
+    setCoopReplayId(stored.party_id)
+  }
+
+  const inCoop = !!view?.coop
 
   useEffect(() => {
     api.cards().then(setCards).catch(() => {})
@@ -42,9 +84,11 @@ export default function App() {
   async function create() {
     setLoading(true); setErr('')
     try {
+      setCoopMember(null)
       const run = await api.createRun(seed ? Number(seed) : undefined)
       applyRun(run)
       setRunId(run.run_id)
+      setCoopPartyId(null)
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -56,10 +100,12 @@ export default function App() {
     if (!resumeId) return
     setLoading(true); setErr('')
     try {
+      setCoopMember(null)
       const run = await api.resume(resumeId)
       applyRun(run)
       setRunId(run.run_id)
       setReplayId(null)
+      setCoopPartyId(null)
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -76,9 +122,11 @@ export default function App() {
     setLoading(true); setErr('')
     try {
       const chapters = expChapters ? Number(expChapters) : undefined
+      setCoopMember(null)
       const data = await api.createExpedition(seed ? Number(seed) : undefined, chapters)
       applyRun(data.run)
       setRunId(data.run.run_id)
+      setCoopPartyId(null)
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -91,10 +139,12 @@ export default function App() {
     if (!target) return
     setLoading(true); setErr('')
     try {
+      setCoopMember(null)
       const data = await api.getExpedition(target)
       applyRun(data.run)
       setRunId(data.run.run_id)
       setReplayId(null)
+      setCoopPartyId(null)
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -135,6 +185,8 @@ export default function App() {
 
   async function newRun() {
     setErr('')
+    setCoopMember(null)
+    setCoopPartyId(null)
     const run = await api.createRun()
     applyRun(run)
     setRunId(run.run_id)
@@ -182,6 +234,15 @@ export default function App() {
             <button onClick={() => openExpeditionReplay()} disabled={loading || !expId}>🎬 整程回放</button>
           </div>
           <div className="divider" />
+          <CoopLobby onStarted={onCoopStarted} />
+          {coopMe?.expedition_id && (
+            <div className="fieldrow">
+              <button className="primary" onClick={resumeCoopExpedition} disabled={loading}>
+                🛡️ 回到协作远征（{coopMe.name}）
+              </button>
+            </div>
+          )}
+          <div className="divider" />
           <div className="fieldrow">
             <span>续局 ID</span>
             <input value={resumeId} onChange={(e) => setResumeId(e.target.value)} placeholder="粘贴 run_id" />
@@ -223,6 +284,7 @@ export default function App() {
             {view.expedition.status === 'lost' && ' · 已终结'}
           </span>
         )}
+        {view.coop && <CoopChip view={view} />}
         <span>生命 {view.health}/{view.max_health}</span>
         <span>金币 {view.gold}</span>
         <span>牌组 {view.deck.length}</span>
@@ -234,6 +296,12 @@ export default function App() {
         {view.expedition && (
           <button className="mini" onClick={() => openExpeditionReplay()} title="逐章播放整段远征（只读）">
             🎬 整程回放
+          </button>
+        )}
+        {inCoop && (
+          <button className="mini" onClick={() => setCoopReplayId(coopPartyId || coopMe?.party_id)}
+            title="队伍时间线、成员台账与逐章整程回放（只读）">
+            🛡️ 队伍回放
           </button>
         )}
         <button className="mini" onClick={newRun}>新局</button>
@@ -275,11 +343,21 @@ export default function App() {
               </div>
             )}
             <DeckView />
+            {inCoop && view.status === 'won' && view.expedition?.status === 'in_progress' && (
+              <p className="comm-hint">
+                🎁 本章队伍嘉奖已入共享金币池（累计 {view.coop.team_bonus}）；
+                {coopMe?.role === 'leader' ? '作为队长，请带队进入下一章。' : '等待队长带队进入下一章（自动同步）…'}
+              </p>
+            )}
             <div className="fieldrow">
               {view.status === 'won' && view.expedition && view.expedition.status === 'in_progress' && (
-                <button className="primary" onClick={advanceChapter} disabled={loading}>
-                  {loading ? '开章中…' : `🚪 进入第 ${view.expedition.chapter + 1} 章`}
-                </button>
+                (!inCoop || coopMe?.role === 'leader') ? (
+                  <button className="primary" onClick={advanceChapter} disabled={loading}>
+                    {loading ? '开章中…' : `🚪 进入第 ${view.expedition.chapter + 1} 章`}
+                  </button>
+                ) : (
+                  <span className="tag waiting">等待队长开章…</span>
+                )
               )}
               {view.expedition && (
                 <button onClick={() => openExpeditionReplay()}>🎬 整程回放</button>
@@ -294,6 +372,18 @@ export default function App() {
         <div className="leftcol">
           <DeckView />
           {!view.in_battle && <PotionBelt />}
+          <CoopRoster
+            view={view}
+            runId={runId}
+            onSync={applyRun}
+            onExpedition={(data) => {
+              // 队长推进了章节：自动切到新章 run（其他队员的端上无缝续战）
+              if (data.expedition.current_run_id !== runId) {
+                applyRun(data.run)
+                setRunId(data.run.run_id)
+              }
+            }}
+          />
           <CompanionPanel />
           <CommissionPanel />
           <EncounterFlags />
@@ -325,6 +415,10 @@ export default function App() {
         <ExpeditionReplay expeditionId={expReplayId} onClose={() => setExpReplayId(null)} />
       )}
 
+      {coopReplayId && (
+        <CoopReplay partyId={coopReplayId} onClose={() => setCoopReplayId(null)} />
+      )}
+
       {err && <div className="error toast">{err}</div>}
     </div>
   )
@@ -342,5 +436,15 @@ function Unlocks({ unlocked }) {
         })}
       </div>
     </div>
+  )
+}
+
+function CoopChip({ view }) {
+  const myId = JSON.parse(localStorage.getItem('cardrun.coop.me') || 'null')?.member_id
+  const me = view.coop.members.find((m) => m.member_id === myId)
+  return (
+    <span className="chip coop-chip" title={`队伍 ${view.coop.member_count} 人 · 队伍嘉奖 ${view.coop.team_bonus}`}>
+      🛡️ {me ? me.role_label : '协作'} · {view.coop.members.length}人 · 🎁{view.coop.team_bonus}
+    </span>
   )
 }

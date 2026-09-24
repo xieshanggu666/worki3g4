@@ -83,6 +83,40 @@ CREATE TABLE IF NOT EXISTS expedition_events (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (exp_id, seq)
 );
+
+-- 多人协作远征：组队（forming）-> 随远征激活（active）-> 结算/解散（settled/disbanded）
+CREATE TABLE IF NOT EXISTS coop_parties (
+    id TEXT PRIMARY KEY,
+    join_code TEXT UNIQUE,         -- 邀请码（仅 forming 期间使用）
+    seed INTEGER,                  -- 队长建队时选定的远征种子（start 时使用）
+    status TEXT NOT NULL,          -- forming / active / settled / disbanded
+    leader_id TEXT NOT NULL,
+    expedition_id TEXT,            -- start 后与远征同体
+    result TEXT,                   -- settled 时：won / lost
+    rev INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coop_members (
+    party_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    token TEXT NOT NULL,           -- 成员持有令牌（鉴权用；绝不下发给其他人）
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,            -- leader / battle / supply
+    seq INTEGER NOT NULL,          -- 加入顺序（队长为 0）
+    left_at TEXT,                  -- 非 NULL 即已离队（forming 阶段退出/被移除）
+    PRIMARY KEY (party_id, member_id)
+);
+
+-- 队伍事件日志：组队/加入/角色调整/离队/开征/章节/结算，整程回放时间线
+CREATE TABLE IF NOT EXISTS coop_events (
+    party_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (party_id, seq)
+);
 """
 
 
@@ -358,6 +392,12 @@ def load_expedition(exp_id):
     return None if row is None else _row_to_expedition(row)
 
 
+def load_expedition_conn(conn, exp_id):
+    """事务内读取远征（与写入同一连接/事务，可见本事务未提交的改动）。"""
+    row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+    return None if row is None else _row_to_expedition(row)
+
+
 def save_expedition_conn(conn, exp_id, status, chapter, current_run_id, carry, expected_rev=None):
     """在事务内推进远征状态并 rev+1；expected_rev 非 None 时做乐观并发检查。"""
     cur = conn.execute(
@@ -421,6 +461,153 @@ def list_expedition_runs(exp_id):
             (exp_id,),
         ).fetchall()
     return [{"run_id": r["id"], "chapter": r["chapter"], "status": r["status"]} for r in rows]
+
+
+# ---------- 多人协作远征 ----------
+def insert_coop_party_conn(conn, party_id, join_code, seed, leader_id):
+    conn.execute(
+        "INSERT INTO coop_parties(id,join_code,seed,status,leader_id,expedition_id,"
+        "result,rev,created_at,updated_at) "
+        "VALUES(?,?,?, 'forming', ?,NULL,NULL,1,datetime('now'),datetime('now'))",
+        (party_id, join_code, seed, leader_id),
+    )
+
+
+def insert_coop_member_conn(conn, party_id, member_id, token, name, role, seq):
+    conn.execute(
+        "INSERT INTO coop_members(party_id,member_id,token,name,role,seq,left_at) "
+        "VALUES(?,?,?,?,?,?,NULL)",
+        (party_id, member_id, token, name, role, seq),
+    )
+
+
+def update_coop_member_conn(conn, party_id, member_id, role=None, left=False,
+                            name=None):
+    if left:
+        conn.execute(
+            "UPDATE coop_members SET left_at=datetime('now') WHERE party_id=? AND member_id=?",
+            (party_id, member_id),
+        )
+        return
+    sets, args = [], []
+    if role is not None:
+        sets.append("role=?"); args.append(role)
+    if name is not None:
+        sets.append("name=?"); args.append(name)
+    if sets:
+        args += [party_id, member_id]
+        conn.execute(
+            f"UPDATE coop_members SET {', '.join(sets)} WHERE party_id=? AND member_id=?",
+            args,
+        )
+
+
+def save_coop_party_conn(conn, party_id, status=None, leader_id=None,
+                         expedition_id=None, result=None):
+    """推进队伍状态（不推 rev：队伍无并发写冲突；rev 仅用于前端轮询判断是否变化）。"""
+    sets, args = [], []
+    if status is not None:
+        sets.append("status=?"); args.append(status)
+    if leader_id is not None:
+        sets.append("leader_id=?"); args.append(leader_id)
+    if expedition_id is not None:
+        sets.append("expedition_id=?"); args.append(expedition_id)
+    if result is not None:
+        sets.append("result=?"); args.append(result)
+    sets.append("rev=rev+1")
+    args.append(party_id)
+    conn.execute(
+        f"UPDATE coop_parties SET {', '.join(sets)}, updated_at=datetime('now') WHERE id=?",
+        args,
+    )
+
+
+def _row_to_party(row):
+    return {
+        "id": row["id"], "join_code": row["join_code"], "seed": row["seed"],
+        "status": row["status"], "leader_id": row["leader_id"],
+        "expedition_id": row["expedition_id"], "result": row["result"],
+        "rev": row["rev"],
+    }
+
+
+def load_coop_party(party_id):
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        row = conn.execute("SELECT * FROM coop_parties WHERE id=?", (party_id,)).fetchone()
+    return None if row is None else _row_to_party(row)
+
+
+def load_coop_party_conn(conn, party_id):
+    row = conn.execute("SELECT * FROM coop_parties WHERE id=?", (party_id,)).fetchone()
+    return None if row is None else _row_to_party(row)
+
+
+def load_coop_party_by_code_conn(conn, code):
+    row = conn.execute(
+        "SELECT * FROM coop_parties WHERE join_code=? AND status='forming'", (code,)
+    ).fetchone()
+    return None if row is None else _row_to_party(row)
+
+
+def load_coop_party_by_exp_conn(conn, exp_id):
+    row = conn.execute(
+        "SELECT * FROM coop_parties WHERE expedition_id=?", (exp_id,)
+    ).fetchone()
+    return None if row is None else _row_to_party(row)
+
+
+def load_coop_members_conn(conn, party_id, include_left=False):
+    sql = ("SELECT member_id,token,name,role,seq,left_at FROM coop_members "
+           "WHERE party_id=?")
+    if not include_left:
+        sql += " AND left_at IS NULL"
+    sql += " ORDER BY seq"
+    rows = conn.execute(sql, (party_id,)).fetchall()
+    return [{
+        "member_id": r["member_id"], "token": r["token"], "name": r["name"],
+        "role": r["role"], "seq": r["seq"], "left": r["left_at"] is not None,
+    } for r in rows]
+
+
+def next_coop_seq_conn(conn, party_id):
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq),0) AS m FROM coop_events WHERE party_id=?", (party_id,)
+    ).fetchone()
+    return row["m"] + 1
+
+
+def append_coop_event_conn(conn, party_id, seq, kind, payload):
+    conn.execute(
+        "INSERT INTO coop_events(party_id,seq,kind,payload_json) VALUES(?,?,?,?)",
+        (party_id, seq, kind, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def load_coop_events(party_id):
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        rows = conn.execute(
+            "SELECT seq, kind, payload_json FROM coop_events WHERE party_id=? ORDER BY seq",
+            (party_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        raw = r["payload_json"]
+        try:
+            payload = json.loads(raw) if raw is not None else {}
+        except (ValueError, TypeError):
+            payload = {"_corrupt": True}
+        if not isinstance(payload, dict):
+            payload = {"_corrupt": True}
+        out.append({"seq": r["seq"], "kind": r["kind"], "payload": payload})
+    return out
 
 
 # ---------- 独立包装：迁移/测试/运维用（单表原子即可的场景） ----------

@@ -493,3 +493,46 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 .enc-flag-row .flag-desc { font-size: 12px; color: #a99fc4; line-height: 1.5; }
 .enc-flag-row .flag-meta { font-size: 11px; color: #8c84a8; }
 .replay-enc-flags { margin-top: 10px; }
+
+/* ---------- 多人协作远征（2.9.0） ---------- */
+.coop-lobby { max-width: 720px; margin: 12px auto; }
+.coop-join-code { font-size: 18px; margin: 10px 0; display: flex; align-items: center; gap: 8px; }
+.coop-join-code b {
+  font-size: 28px; letter-spacing: 4px; background: #20243f;
+  border: 1px solid #4a5380; border-radius: 8px; padding: 2px 12px; color: #ffd166;
+}
+.tag.forming { background: #2c3f63; color: #cfe2ff; border-radius: 10px; padding: 2px 10px; font-size: 12px; }
+.tag.waiting { color: #9fb3d9; font-size: 13px; }
+.coop-members { list-style: none; padding: 0; margin: 10px 0; display: flex; flex-direction: column; gap: 6px; }
+.coop-member {
+  display: flex; align-items: center; gap: 10px;
+  background: #1c1f33; border-radius: 8px; padding: 8px 12px;
+  border-left: 3px solid #555;
+}
+.coop-member.role-leader { border-left-color: #ffd166; }
+.coop-member.role-battle { border-left-color: #e07a5f; }
+.coop-member.role-supply { border-left-color: #81b29a; }
+.coop-name { flex: 1; }
+.role-chip.leader { background: #4a3d18; color: #ffd166; }
+.role-chip.battle { background: #4a241c; color: #ffb59f; }
+.role-chip.supply { background: #22402f; color: #9fd8b4; }
+.coop-role-btns { display: flex; gap: 4px; }
+.coop-role-btns .mini.on { background: #3a4c7a; }
+
+.coop-chip { background: #26304d; color: #cfe0ff; border: 1px solid #3d4f7c; }
+
+.coop-roster h3 { margin: 4px 0; }
+.coop-myrole { font-size: 13px; margin-bottom: 6px; }
+.coop-stats { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.coop-stats li { background: #1c1f33; border-radius: 8px; padding: 6px 10px; border-left: 3px solid #555; }
+.coop-stats li.role-leader { border-left-color: #ffd166; }
+.coop-stats li.role-battle { border-left-color: #e07a5f; }
+.coop-stats li.role-supply { border-left-color: #81b29a; }
+.coop-stat-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 2px; }
+.coop-stat-row { display: flex; justify-content: space-between; font-size: 11px; color: #99a; }
+.coop-bonus { margin-top: 8px; font-size: 13px; color: #ffd166; }
+
+.coop-replay-events { max-height: 30vh; overflow: auto; font-size: 12px; margin: 8px 0; }
+.coop-replay-events .ev-row { padding: 3px 0; border-bottom: 1px solid #262a40; }
+.coop-ledger { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.coop-ledger .lrow { display: flex; justify-content: space-between; background: #1c1f33; border-radius: 6px; padding: 6px 10px; }

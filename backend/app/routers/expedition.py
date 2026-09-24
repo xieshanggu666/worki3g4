@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
 from .. import service
+from .. import coop as coop_mod
 from ..schemas import AdvanceRequest, CreateExpeditionRequest
 
 router = APIRouter(prefix="/api/expeditions", tags=["expedition"])
@@ -25,7 +26,12 @@ def get_expedition(exp_id: str):
 @router.post("/{exp_id}/advance")
 def advance(exp_id: str, body: AdvanceRequest):
     try:
-        return service.advance_expedition(exp_id, request_id=body.request_id)
+        return service.advance_expedition(
+            exp_id, request_id=body.request_id,
+            member_id=body.member_id, token=body.token)
+    except (coop_mod.CoopAuthError, coop_mod.CoopPermissionError) as e:
+        # 协作远征：令牌错误/非队长推进 -> 403，零副作用
+        raise HTTPException(status_code=403, detail=str(e))
     except service.DuplicateReward as e:
         # 远征已结算：不重复结算、不再开章
         raise HTTPException(status_code=409, detail=str(e))
