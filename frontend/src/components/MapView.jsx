@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoSupply, permHint } from '../coopPerms'
 
 const TYPE_LABEL = {
   encounter: '遭遇',
@@ -22,8 +23,12 @@ export default function MapView({ view }) {
 
   const m = view.map
   const position = view.position
+  // 协作远征：选节点是资源动作，战斗位看到的路线按钮被禁用（服务端权威拦截）
+  const supplyAllowed = canDoSupply(view)
+  const denyHint = permHint(view, 'supply')
 
   async function go(node) {
+    if (!supplyAllowed) return
     setBusy(true); setErr('')
     try {
       const res = await api.act(runId, { action: 'choose_node', node })
@@ -59,13 +64,17 @@ export default function MapView({ view }) {
       {view.in_battle && (
         <p className="maplocked">⚔️ 战斗进行中，击败敌人后才能继续推进路线</p>
       )}
+      {!view.in_battle && denyHint && (
+        <p className="maplocked coop-deny">🔒 {denyHint}（等待资源位/队长选择路线）</p>
+      )}
       <div className="mapgrid">
         {Object.keys(byRow).sort((a, b) => Number(a) - Number(b)).map((r) => (
           <div className="maprow" key={r}>
             {byRow[r].map(({ nid, node }) => {
               // 战斗未分胜负前路线必须锁定：后端会拒绝战斗中换节点，前端也
               // 直接禁用，避免误点跳过遭遇（含首领战中返回旧节点）。
-              const reachable = !view.in_battle && view.reachable.some((x) => x.id === nid)
+              const reachable = !view.in_battle && supplyAllowed
+                && view.reachable.some((x) => x.id === nid)
               const isCur = nid === position
               return (
                 <button
@@ -73,6 +82,8 @@ export default function MapView({ view }) {
                   className={`mnode ${node.type} ${isCur ? 'cur' : ''} ${reachable ? 'reachable' : ''}`}
                   onClick={() => reachable && go(nid)}
                   disabled={!reachable || busy}
+                  title={!supplyAllowed && view.reachable.some((x) => x.id === nid)
+                    ? denyHint : undefined}
                 >
                   <span className="mlabel">{TYPE_LABEL[node.type]}</span>
                   <span className="msub">{isCur ? '●' : node.enemy || ''}</span>

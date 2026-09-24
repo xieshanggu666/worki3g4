@@ -493,3 +493,100 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 .enc-flag-row .flag-desc { font-size: 12px; color: #a99fc4; line-height: 1.5; }
 .enc-flag-row .flag-meta { font-size: 11px; color: #8c84a8; }
 .replay-enc-flags { margin-top: 10px; }
+
+/* ========== 多人协作远征（2.9.0） ========== */
+.coop-home-entry { width: 100%; margin: 6px 0 2px; }
+.coop-home-entry button { width: 100%; }
+.coop-back { margin-top: 12px; text-align: center; }
+
+.coop-lobby {
+  max-width: 720px; margin: 4vh auto; padding: 22px 26px;
+  border: 1px solid #3f7a64; background: linear-gradient(165deg, #1d2a26, #1a2026);
+}
+.coop-lobby h2 { color: #9fe8c8; margin: 0 0 10px; }
+.coop-intro { color: #a9bcb2; font-size: 13px; line-height: 1.7; margin: 0 0 14px; }
+.coop-home-actions { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.coop-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.coop-resume { margin-top: 10px; }
+.coop-code-input { letter-spacing: .35em; font-weight: 700; font-size: 18px; text-transform: uppercase; }
+
+.coop-statusline { display: flex; gap: 12px; align-items: center; margin: 8px 0; color: #b8c7c0; font-size: 13px; }
+.chip.coop-status.forming { background: #283b33; color: #9fe8c8; border-color: #3f7a64; }
+.chip.coop-status.started { background: #2a3347; color: #a9c7ff; border-color: #4a6fa5; }
+
+.coop-code-box {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: #16211d; border: 1px dashed #4a8a70; border-radius: 10px;
+  padding: 10px 14px; margin: 10px 0 14px;
+}
+.coop-code-label { color: #8fa39a; font-size: 12px; }
+.coop-code { font-size: 26px; font-weight: 800; letter-spacing: .32em; color: #ffe08a; }
+.coop-code-box .sub { color: #6c8178; font-size: 11px; margin-left: auto; }
+
+.coop-members { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.coop-member {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: #1e2a26; border: 1px solid #335047; border-radius: 10px; padding: 9px 12px;
+}
+.coop-member.me { border-color: #6fb58f; box-shadow: inset 0 0 0 1px rgba(159,232,200,.25); }
+.coop-member-icon { font-size: 18px; }
+.coop-member-name { color: #e2efe8; font-weight: 600; }
+.coop-me-tag { color: #9fe8c8; font-style: normal; font-size: 11px; margin-left: 2px; }
+.coop-leader-tag {
+  background: #4a3a1c; color: #ffd166; border-radius: 999px; padding: 1px 7px;
+  font-style: normal; font-size: 10px; margin-left: 6px;
+}
+.coop-member-role { color: #93a89e; font-size: 12px; }
+.coop-member-stat { margin-left: auto; color: #ffd9a0; font-size: 12px; }
+.coop-role-btns { display: flex; gap: 6px; margin-left: auto; }
+.coop-role-btns .mini.on { outline: 1px solid #6fb58f; color: #9fe8c8; }
+.coop-hint { color: #8fa39a; font-size: 12px; line-height: 1.6; margin: 12px 0 0; }
+
+/* 协作侧栏 */
+.coop-chip { background: #1d2f29; color: #9fe8c8; border-color: #3f7a64; }
+.panellist.coop-panel { border-left: 3px solid #3f7a64; }
+.coop-me-perm { font-size: 12px; color: #b8c7c0; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+.coop-perm-tags { display: flex; gap: 6px; }
+.perm { font-style: normal; border-radius: 999px; padding: 1px 8px; font-size: 11px; }
+.perm.battle { background: #3a2b2b; color: #ffb3a0; border: 1px solid #6f453f; }
+.perm.supply { background: #2a3326; color: #bfe08a; border: 1px solid #56703f; }
+.coop-roster { list-style: none; margin: 0 0 6px; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.coop-roster-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #1d2823; border-radius: 8px; padding: 5px 9px; font-size: 12px;
+}
+.coop-roster-row.me { outline: 1px solid #3f7a64; }
+.coop-code-inline { letter-spacing: .2em; color: #ffe08a; }
+
+/* 越权提示 */
+.coop-deny {
+  background: #3a2b2b !important; border: 1px solid #7a4a3f; color: #ffc4b0;
+  border-radius: 8px; padding: 7px 11px;
+}
+.battle-coop-deny {
+  position: absolute; right: 18px; top: 12px; z-index: 5;
+  background: rgba(40, 28, 26, .92); border: 1px solid #7a4a3f; color: #ffc4b0;
+  border-radius: 9px; padding: 6px 12px; font-size: 12px;
+}
+.maplocked.coop-deny { margin: 6px 0; }
+
+/* 协作整程回放 */
+.coop-events { flex-wrap: wrap; }
+.coop-event-who { color: #9fe8c8; font-style: normal; margin: 0 2px; }
+.coop-replay-grid { display: grid; grid-template-columns: 260px 1fr; gap: 12px; flex: 1; min-height: 0; }
+.coop-ledger { overflow-y: auto; padding: 12px 14px; }
+.coop-ledger h3 { margin: 0 0 10px; color: #9fe8c8; }
+.coop-ledger-member {
+  border-left: 3px solid #3f7a64; background: #1d2823; border-radius: 0 8px 8px 0;
+  padding: 7px 10px; margin-bottom: 9px; display: flex; flex-direction: column; gap: 3px;
+}
+.coop-ledger-member b { color: #e2efe8; font-size: 13px; }
+.coop-ledger-member .coop-member-role { font-size: 11px; }
+.coop-ledger-member .coop-member-stat { margin-left: 0; font-size: 11px; }
+.coop-ledger-rows { list-style: none; margin: 3px 0 0; padding: 0; color: #a9c2b4; font-size: 11px; }
+.rc-actor { font-size: 12px; color: #9fe8c8; margin: 4px 0; }
+.rc-actor em { color: #8fa39a; font-style: normal; margin-left: 6px; font-size: 11px; }
+@media (max-width: 1100px) {
+  .coop-replay-grid { grid-template-columns: 1fr; }
+  .coop-ledger { max-height: 180px; }
+}

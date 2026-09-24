@@ -27,7 +27,10 @@ def get_run(run_id: str):
 @router.post("/{run_id}/act")
 def act(run_id: str, body: ActRequest):
     try:
-        return service.act(run_id, body.model_dump())
+        return service.act(run_id, body.model_dump(), member_id=body.member_id)
+    except service.PermissionDenied as e:
+        # 协作远征权限边界：角色无权提交该动作（校验先于任何状态变更，零副作用）
+        raise HTTPException(status_code=403, detail=str(e))
     except service.DuplicateReward as e:
         # 重复领奖/重复锻造：业务幂等键拦截（含并发情况下后到的请求）
         raise HTTPException(status_code=409, detail=str(e))
@@ -42,9 +45,9 @@ def act(run_id: str, body: ActRequest):
 
 
 @router.get("/{run_id}/resume")
-def resume(run_id: str):
+def resume(run_id: str, member_id: str | None = None):
     try:
-        return service.resume(run_id)
+        return service.resume(run_id, member_id=member_id)
     except service.InvalidAction as e:
         raise HTTPException(status_code=400, detail=str(e))
 

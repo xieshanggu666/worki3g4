@@ -14,6 +14,9 @@ import EncounterView from './components/EncounterView.jsx'
 import EncounterFlags from './components/EncounterFlags.jsx'
 import ReplayPlayer from './components/ReplayPlayer.jsx'
 import ExpeditionReplay from './components/ExpeditionReplay.jsx'
+import CoopLobby from './components/CoopLobby.jsx'
+import CoopPanel from './components/CoopPanel.jsx'
+import CoopReplay from './components/CoopReplay.jsx'
 
 export default function App() {
   const { view, setCards, cards, runId, setRunId, applyRun } = useStore()
@@ -29,6 +32,10 @@ export default function App() {
   const [replayId, setReplayId] = useState(null)
   // 远征整程回放：expReplayId 非 null 时覆盖全屏（逐章切换，同样只读隔离）
   const [expReplayId, setExpReplayId] = useState(null)
+  // 多人协作：showCoop 显示大厅；coopReplayId 非 null 时覆盖协作整程回放
+  const [showCoop, setShowCoop] = useState(false)
+  const [coopReplayId, setCoopReplayId] = useState(null)
+  const [coopTeamId, setCoopTeamId] = useState('')
 
   useEffect(() => {
     api.cards().then(setCards).catch(() => {})
@@ -112,7 +119,12 @@ export default function App() {
     if (!expeditionId) return
     setLoading(true); setErr('')
     try {
-      const data = await api.advanceExpedition(expeditionId)
+      // 协作远征走队伍推进接口（服务端校验仅队长可操作）；单人远征走原接口
+      const coopTeamId = view?.coop?.team_id
+      if (coopTeamId) setCoopTeamId(coopTeamId)
+      const data = coopTeamId
+        ? await api.advanceCoopExpedition(coopTeamId)
+        : await api.advanceExpedition(expeditionId)
       applyRun(data.run)
       setRunId(data.run.run_id)
     } catch (e) {
@@ -120,6 +132,27 @@ export default function App() {
     } finally {
       setLoading(false)
     }
+  }
+
+  function enterCoopRun(team, runView = null) {
+    setShowCoop(false)
+    setCoopTeamId(team.id)
+    if (runView) {
+      applyRun(runView)
+      setRunId(runView.run_id)
+      return
+    }
+    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口
+    setLoading(true); setErr('')
+    api.getCoopExpedition(team.id)
+      .then((data) => {
+        if (data.run) {
+          applyRun(data.run)
+          setRunId(data.run.run_id)
+        }
+      })
+      .catch((e) => setErr(e.message))
+      .finally(() => setLoading(false))
   }
 
   async function refreshRun() {
@@ -175,6 +208,11 @@ export default function App() {
               {loading ? '创建中…' : '🚩 新建远征（多章连征）'}
             </button>
           </div>
+          <div className="coop-home-entry">
+            <button className="primary" onClick={() => setShowCoop(true)} disabled={loading}>
+              👥 多人协作远征（组队 · 角色分工 · 共享章节）
+            </button>
+          </div>
           <div className="fieldrow">
             <span>远征 ID</span>
             <input value={expId} onChange={(e) => setExpId(e.target.value)} placeholder="粘贴 expedition_id" />
@@ -205,6 +243,18 @@ export default function App() {
     )
   }
 
+  if (showCoop) {
+    return (
+      <div className="screen home">
+        <CoopLobby onEnterRun={enterCoopRun} />
+        <div className="coop-back">
+          <button onClick={() => setShowCoop(false)}>← 返回单人入口</button>
+        </div>
+        {coopReplayId && <CoopReplay teamId={coopReplayId} onClose={() => setCoopReplayId(null)} />}
+      </div>
+    )
+  }
+
   const hasReward = !view.reward_claimed && view.reward_options && view.reward_options.length > 0
   const hasForge = view.forge_available === true
   const hasEncounter = !view.in_battle && !!view.encounter
@@ -223,6 +273,12 @@ export default function App() {
             {view.expedition.status === 'lost' && ' · 已终结'}
           </span>
         )}
+        {view.coop && (
+          <span className="chip coop-chip" title={`入队码 ${view.coop.code} · 角色分工协作`}>
+            👥 协作队 {view.coop.members.length} 人
+            {view.coop.me && <> · {view.coop.me.icon} {view.coop.me.role_label}</>}
+          </span>
+        )}
         <span>生命 {view.health}/{view.max_health}</span>
         <span>金币 {view.gold}</span>
         <span>牌组 {view.deck.length}</span>
@@ -234,6 +290,12 @@ export default function App() {
         {view.expedition && (
           <button className="mini" onClick={() => openExpeditionReplay()} title="逐章播放整段远征（只读）">
             🎬 整程回放
+          </button>
+        )}
+        {view.coop && (
+          <button className="mini" onClick={() => setCoopReplayId(view.coop.team_id)}
+                  title="队伍时间线 + 个人战利 + 逐章回放（只读）">
+            👥 协作回放
           </button>
         )}
         <button className="mini" onClick={newRun}>新局</button>
@@ -265,24 +327,50 @@ export default function App() {
             {view.status === 'won' && view.expedition?.status === 'in_progress' &&
               (view.commissions || []).filter((q) => q.can_claim).length > 0 && (
               <div className="endcomm">
-                <p className="comm-hint">📜 有委托已完成，可在进入下一章前先领取奖励：</p>
-                {view.commissions.filter((q) => q.can_claim).map((q) => (
-                  <button key={q.id} className="primary comm-claim-end"
-                          onClick={() => claimCommission(q.id)} disabled={loading}>
-                    🎁 {q.kind === 'battle' ? '讨伐' : '贸易'}委托 · {q.reward.text}
-                  </button>
-                ))}
+                <p className="comm-hint">
+                  📜 有委托已完成，可在进入下一章前先领取奖励
+                  {view.coop && view.coop.me && view.coop.me.role !== 'leader' && view.coop.me.role !== 'supply'
+                    ? '（请资源位/队长领取）' : '：'}
+                </p>
+                {view.commissions.filter((q) => q.can_claim).map((q) => {
+                  const canClaim = !view.coop
+                    || view.coop.me?.role === 'leader' || view.coop.me?.role === 'supply'
+                  return (
+                    <button key={q.id} className="primary comm-claim-end"
+                            onClick={() => claimCommission(q.id)}
+                            disabled={loading || !canClaim}
+                            title={canClaim ? undefined : '只有资源位/队长能领取委托'}>
+                      {canClaim ? '🎁' : '🔒'} {q.kind === 'battle' ? '讨伐' : '贸易'}委托 · {q.reward.text}
+                    </button>
+                  )
+                })}
               </div>
             )}
             <DeckView />
+            {view.coop && view.status === 'won' && view.expedition?.status === 'in_progress' && (
+              <p className="comm-hint">
+                {view.coop.me?.role === 'leader'
+                  ? '你是队长：请确认队员都已领取完奖励，然后带队进入下一章。'
+                  : '本章已通关，等待队长 👑 带队进入下一章（协作金已入共享池）。'}
+              </p>
+            )}
             <div className="fieldrow">
               {view.status === 'won' && view.expedition && view.expedition.status === 'in_progress' && (
-                <button className="primary" onClick={advanceChapter} disabled={loading}>
-                  {loading ? '开章中…' : `🚪 进入第 ${view.expedition.chapter + 1} 章`}
-                </button>
+                (!view.coop || view.coop.me?.role === 'leader') ? (
+                  <button className="primary" onClick={advanceChapter} disabled={loading}>
+                    {loading ? '开章中…' : `🚪 进入第 ${view.expedition.chapter + 1} 章`}
+                  </button>
+                ) : (
+                  <button className="primary" disabled title="只有队长可以推进章节">
+                    ⏳ 等待队长开章
+                  </button>
+                )
               )}
-              {view.expedition && (
+              {view.expedition && !view.coop && (
                 <button onClick={() => openExpeditionReplay()}>🎬 整程回放</button>
+              )}
+              {view.coop && (
+                <button onClick={() => setCoopReplayId(view.coop.team_id)}>👥 协作回放</button>
               )}
               <button className="primary" onClick={newRun}>再来一局</button>
             </div>
@@ -295,6 +383,7 @@ export default function App() {
           <DeckView />
           {!view.in_battle && <PotionBelt />}
           <CompanionPanel />
+          <CoopPanel />
           <CommissionPanel />
           <EncounterFlags />
           {view.unlocked_cards && <Unlocks unlocked={view.unlocked_cards} />}
@@ -323,6 +412,10 @@ export default function App() {
 
       {expReplayId && (
         <ExpeditionReplay expeditionId={expReplayId} onClose={() => setExpReplayId(null)} />
+      )}
+
+      {coopReplayId && (
+        <CoopReplay teamId={coopReplayId} onClose={() => setCoopReplayId(null)} />
       )}
 
       {err && <div className="error toast">{err}</div>}

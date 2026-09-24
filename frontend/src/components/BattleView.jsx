@@ -5,6 +5,7 @@ import { bus } from '../phaser/battleBus'
 import { startPhaser, STATUS_ZH } from '../phaser/BattleScene.js'
 import { growthNodesOf, growthTag } from '../growth'
 import PotionBelt from './PotionBelt.jsx'
+import { canDoBattle, permHint } from '../coopPerms'
 
 export default function BattleView({ view }) {
   const mountRef = useRef(null)
@@ -110,12 +111,18 @@ export default function BattleView({ view }) {
   }
 
   function canPlay(hc) {
-    return inTurn && hc.cost <= energy && busy === false
+    return inTurn && hc.cost <= energy && busy === false && battleAllowed
   }
+
+  const battleAllowed = canDoBattle(view)
+  const battleDeny = permHint(view, 'battle')
 
   return (
     <div className="battle">
       <div ref={mountRef} className="phaser" />
+      {!battleAllowed && (
+        <div className="battle-coop-deny">🔒 {battleDeny}（观战中，等待战斗位/队长操作）</div>
+      )}
       {b?.companion && (
         <div className={`battle-companion ${b.companion.alive === false || b.companion.hp <= 0 ? 'down' : ''}`}>
           <b>🛡️ {b.companion.name}</b>
@@ -152,7 +159,9 @@ export default function BattleView({ view }) {
           })}
         </div>
         {busy && <span className="hint settling">结算中…</span>}
-        <button className="primary" onClick={() => doAct('end_turn')} disabled={!inTurn || busy}>
+        <button className="primary" onClick={() => doAct('end_turn')}
+                disabled={!inTurn || busy || !battleAllowed}
+                title={!battleAllowed ? battleDeny : undefined}>
           结束回合
         </button>
       </div>

@@ -35,6 +35,20 @@
   逐章与整程回放逐位校验（旧 2.8.0 前存档首次载入补空 enc_state，旧 create 校验点
   形状按缺字段候选兼容比对）
 - 卡牌效果统一经 **结算队列** 处理，支持连锁触发、状态叠加、死亡打断
+- **多人协作远征（规则 2.9.0）**：队长在大厅生成 6 位入队码组建队伍（2~4 人），
+  开赛前为队员分配 **⚔️ 战斗位**（打牌/结束回合/战斗中用药）与 **🎒 资源位**
+  （路线/领奖/锻造/商店/药水整理/伙伴/委托/奇遇），队长两个领域都可操作并负责
+  开章与推进；所有成员操作的是**同一个章节 run**——同一条确定性动作日志、
+  同一事务/`rev` 乐观锁/`request_id` 幂等串行化，共享章节状态并同步结算。
+  权限边界在**任何状态变更之前**校验（越权 403、零副作用；前端按钮同步禁用仅为
+  体验优化，绕过后端照样拒绝），每步动作日志记录 `actor`（操作者）。击败章节
+  首领的**协作金 +15 入共享金币池**（纯推演、进校验点、随交接快照跨章），个人
+  贡献（战斗胜利/后勤操作次数）与章节/终胜名义均分（终胜 +50/人）记 `coop_ledger`；
+  战败整队同事务结算 lost（只结算一次，已落袋协作金不追回），终章通关结算 won。
+  队伍时间线（form/join/role/start/chapter_clear/advance/settle）+ 个人战利 +
+  逐章可交互回放（每帧标注操作者）由 `GET /api/coop/teams/{id}/replay` 提供，
+  全程只读隔离。run 状态新增 `coop_team`（进入交接快照；旧档首次载入补 None，
+  回放按 16 种字段形状候选兼容 2.9.0 之前的校验点），单人远征行为完全不变。
 - **战斗演出**：Phaser 场景按服务端结算顺序逐条播放（待机/攻击/受击/死亡动画、护盾与状态实时刷新），
   播放期间操作锁定，播完再应用权威快照同步血量/护盾/手牌，战斗结束衔接领奖
 - 服务端权威校验行动，防作弊；失败解锁新卡
@@ -122,7 +136,16 @@ flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/�
 战斗消耗一次、无续写 flag 兑现即移除而续写 flag 保留、续写候选优先必触发、
 伏击战胜利固定战利品并推进讨伐委托/破财清 flag/伏击败北终结远征、待抉择/伏击
 续局、两章合法流程逐章/整程回放第 2 章零 mismatch/error 且最终帧与在线一致、
-旧档补 enc_state 迁移与旧 create 8 形状候选兼容）**。
+旧档补 enc_state 迁移与旧 create 8 形状候选兼容）**、
+**多人协作远征 2.9.0（队长建队/6 位入队码/满员·重复名·错误码拒绝/入队幂等、
+开赛前角色分配且非队长 403·队长角色不可改·开赛锁定、人数不足拒开赛且开赛幂等不重复、
+战斗位越权选节点与资源位越权打牌/购买均 403 且金币·能量·手牌·库存零变化、
+未带身份/他队成员/伪造 id 403、队长两域皆可、过期 expected_rev 409、同 request_id 幂等、
+首领击败协作金 15 入共享池并随交接带入第 2 章、个人贡献计数与章节 15/终胜 50 名义均分
+入 ledger、战败整队 lost 且 settle 只一次、非队长推进 403 而队长推进继承队伍与协作金、
+金币不足锻造 400 整体回退、合法两角色行动流程逐章/整程回放校验点零 mismatch 且每步带
+操作者、第 2 章从 carry（含 coop_team）重建校验一致、协作视口携带权限边界、单人远征
+携带 member_id 行为不变）**。
 
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
@@ -140,6 +163,7 @@ flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/�
 多章远征：
 - `POST /api/expeditions {seed?, chapters?}` 创建远征（默认 3 章）：远征记录与第 1 章 run
   在同一事务落库；返回 `{expedition, run}`，run 视口携带 `expedition` 摘要（章节进度/结算状态）。
+  协作远征不直接走本接口——由队伍开赛（见下）在同一开章路径上附带 `coop_team`。
 - `GET  /api/expeditions/{id}` 远征视口 + 当前章节 run 视口（续远征入口）。
 - `POST /api/expeditions/{id}/advance {request_id?}` 进入下一章：仅当远征进行中且当前章
   已通关；以交接快照（牌组/锻造/遗物/金币/生命，休整回血 25%）确定性开新章
@@ -150,6 +174,35 @@ flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/�
 - 章节 run 就是普通 run（`/api/runs/{id}/act|resume|replay` 全部适用）；章节 run 结束时
   （won/lost）与行动同一事务同步远征状态：非终章通关记录 chapter_clear 交接快照，
   战败/终章通关结算远征（settle），已结算或非当前章节的重复触发直接跳过。
+
+多人协作远征（`/api/coop/...`，规则 2.9.0）：
+- `POST /api/coop/teams {captain_name?, name?, seed?, chapters?}` 队长建队：
+  返回队伍视口，顶层 `me` 里是队长本人（含**只下发一次**的 `token` 与 `id`），
+  `code` 为 6 位入队码。
+- `POST /api/coop/teams/join {code, member_name, request_id?}` 凭码加入（仅 forming、
+  最多 4 人、显示名不重复；同 request_id 幂等），响应 `me` 携带该队员的 id/token。
+- `GET  /api/coop/teams/{id}?member_id=` 队伍大厅视口（成员/角色/个人贡献战利/时间线）。
+- `POST /api/coop/teams/{id}/roles {member_id(队长), target_id, role:combat|supply, request_id?}`
+  队长分配角色（仅 forming；队长身份不可改；非队长 403；重复同角色 409）。
+- `POST /api/coop/teams/{id}/leave|disband {member_id}` 开赛前退队/解散（队长退队即解散）。
+- `POST /api/coop/teams/{id}/start {member_id(队长), request_id?}` 开赛：至少 2 人，
+  forming→started 与远征/第 1 章 run/双方日志同事务提交（双击同令牌幂等、重复开赛 409），
+  返回 `{team, expedition, run}`。
+- `GET  /api/coop/teams/{id}/expedition?member_id=` 协作远征续局：队伍 + 当前章节 run
+  视口（`run.coop` 含成员/角色/本成员权限/奖励常量）。
+- `POST /api/coop/teams/{id}/advance {member_id, request_id?}` 仅队长推进章节（非队长 403）。
+- `GET  /api/coop/teams/{id}/replay` 协作整程回放：队伍时间线 + `ledger` 个人流水 +
+  远征事件 + 逐章可交互回放（每步 `actor` 为操作者），全程只读。
+- 协作章节 run 的行动仍走 `POST /api/runs/{id}/act`，请求体额外带 `member_id`；
+  `/resume?member_id=` 用于高亮本成员。权限：战斗动作（play/end_turn/use_potion）
+  限 leader/combat，资源动作（choose_node/claim_reward/forge/shop_buy/shop_remove/
+  discard_potion/companion_set_mode/commission_accept/commission_claim/encounter_choice）
+  限 leader/supply；越权 403 且零副作用，未带身份或他队成员同样 403。
+  单人远征/普通局忽略 member_id，行为与旧版完全一致。
+- 队伍奖励：章节首领击败 +`CHAPTER_CLEAR_BONUS=15` 金入共享池（run.gold，随交接跨章）；
+  通关/终胜时按当时在册成员确定性均分名义金（整除余数按成员 id 升序）记入
+  `coop_ledger`（chapter +15、win +`FINAL_WIN_BONUS=50`），不进共享池、不影响 run 校验点；
+  战斗位每胜一场、资源位每做一个资源动作各记一次贡献。战败整队 lost，不发终胜金。
 
 卡牌成长树（锻造节点）：`{action:"forge", card:<卡牌实例 uid>, growth_node:<节点 id>}`
 （旧客户端用 `branch` 传 T1 节点 id 也兼容）。节点分三层收费（入门 25 / 进阶 40 / 终阶 60，
@@ -325,10 +378,14 @@ flag 随交接继承与 carry 摘要、开章预兆（敌人+血/力量/格挡/�
   在读取时降级为 `_corrupt` 行，回放标注 `error` 仍可播放其余步骤；序号缺口给出 `warning`
   与 `verification.seq_gaps`。
 - SQLite：`runs`（状态，含 rev 乐观版本、商店库存/交易记录、expedition_id/chapter 远征归属）、
-  `battle_events`（动作日志，含 forge/shop 行）、`profile`（解锁卡）、
+  `battle_events`（动作日志，含 forge/shop 行；协作远征每步 payload 带 actor/actor_role）、
+  `profile`（解锁卡）、
   `act_requests`（request_id → 首次响应，请求级幂等）、
-  `expeditions`（远征：状态/章节进度/交接快照 carry_json/rev）、
-  `expedition_events`（远征事件：create/chapter_clear/advance/settle，整程回放时间线）。
+  `expeditions`（远征：状态/章节进度/交接快照 carry_json/rev/coop_team_id）、
+  `expedition_events`（远征事件：create/chapter_clear/advance/settle，整程回放时间线）、
+  `coop_teams`（协作队伍：入队码/队长/状态/绑定远征/rev）、`coop_members`（成员：
+  入会令牌 token/角色 leader·combat·supply/入队序）、`coop_events`（队伍时间线）、
+  `coop_ledger`（个人贡献与名义战利流水）、`coop_requests`（队伍管理动作幂等）。
 - 远征章节 run 的初始状态由 `_new_run_state(seed, carry, chapter, chapters_total,
   expedition_id)` 构造：新 run 的章号/总章数/远征 id 只认真实入参（carry 里的同名字段
   是「来源章」历史快照，不参与新 run 身份判定）；在线开章与回放重建共用同一函数，交接

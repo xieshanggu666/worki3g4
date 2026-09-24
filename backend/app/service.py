@@ -16,6 +16,7 @@ from . import commissions as commission_mod
 from . import potions as potions_mod
 from . import companions as companions_mod
 from . import encounters as enc_mod
+from . import coop as coop_mod
 from .cards import all_cards, get_card
 from .engine import Battle, _statuses_public
 from .forging import FORGE_COST, effective_card, node_name, growth_node_cost, validate_unlock
@@ -68,11 +69,22 @@ from .settlement import EffectEvent, SettlementQueue
 #        伏击战胜利发放固定战利品、战败终结远征。旧档无 enc_state 字段，首次
 #        载入补 fresh_state（结构迁移，本步按 legacy 处理）；旧 create 校验点
 #        形状缺该字段，回放候选按 include_encounters=False 比对兼容。
-RULES_VERSION = "2.8.0"
+# 2.9.0：多人协作远征——队长组建队伍（入队码 + 入会令牌）、为队员分配
+#        战斗位/资源位；队员通过同一章节 run 分别承担战斗操作（打牌/结束回合/
+#        战斗用药）或资源操作（路线/锻造/商店/药水整理/伙伴/委托/奇遇），
+#        共享章节状态并经同一事务/乐观 rev/request_id 串行化同步结算。动作
+#        payload 携带 actor（member_id），权限边界在任何状态变更之前校验
+#        （越权 403 零副作用）；章节首领击败追加协作金入共享金币池（纯推演、
+#        进校验点），个人战利（战斗胜利/后勤/章节均分/终胜均分）记 coop_ledger；
+#        战败整队同事务回退为 lost；整程回放时间线叠加队伍事件与每步操作者。
+#        run 状态新增 coop_team（队伍 id；单人远征为 None）进入交接快照，
+#        旧 create 校验点缺该字段，回放候选按 include_coop=False 比对兼容。
+RULES_VERSION = "2.9.0"
 GROWTH_RULES_VERSION = "2.3.0"  # 成长树规则起始版本：更早的 forge 日志走兼容重演
 COMPANION_RULES_VERSION = "2.6.0"  # 伙伴字段进入 run 状态：更早日志的迁移步前按 legacy 比对
 BLOCK_RULES_VERSION = "2.7.0"  # 格挡/援护结算顺序修复：更早日志的战斗动作走旧时序重演
 ENCOUNTER_RULES_VERSION = "2.8.0"  # 奇遇链：enc_state 进入 run 状态与交接快照
+COOP_RULES_VERSION = "2.9.0"  # 协作远征：coop_team 进入 run 状态与交接快照
 
 
 def _ver_lt(ver, baseline):
@@ -103,6 +115,11 @@ class InvalidAction(Exception):
     pass
 
 
+class PermissionDenied(Exception):
+    """协作远征权限边界：成员角色无权提交该动作（403，校验先于任何状态变更）。"""
+    pass
+
+
 class ShopSoldOut(Exception):
     """商店货架项已售出（重复购买/重复移除同一卡牌实例）。"""
     pass
@@ -123,7 +140,8 @@ def _new_instance(cid):
     return {"id": cid, "growth": []}
 
 
-def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expedition_id=None):
+def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expedition_id=None,
+                   coop_team=None):
     """构造初始 run 状态。
 
     carry 非 None（远征章节 run）时以交接快照为起点：牌组（含锻造成长）、遗物、
@@ -145,6 +163,7 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
             "potions": [],
             "companion": None,
             "enc_state": enc_mod.fresh_state(),
+            "coop_team": None,
         }
         heal = 0
         opener_heal = 0
@@ -193,6 +212,8 @@ def _new_run_state(seed, carry=None, chapter=None, chapters_total=None, expediti
         "chapter": chapter if chapter is not None else carry.get("chapter"),
         "chapters_total": (chapters_total if chapters_total is not None
                            else carry.get("chapters_total")),
+        # 2.9.0：协作队伍归属（普通局/单人远征为 None）；新章默认从交接快照继承
+        "coop_team": (coop_team if coop_team is not None else carry.get("coop_team")),
         "in_battle": False,
         "battle_index": 0,
         "battle": None,
@@ -300,6 +321,10 @@ def _migrate_state(run):
         run["enc_state"] = enc_state
         if enc_changed:
             changed = True
+    # 2.9.0：协作远征队伍归属（旧档无此字段：单人/旧远征补 None，随本步原子落库）
+    if "coop_team" not in run:
+        run["coop_team"] = None
+        changed = True
     return changed
 
 
@@ -353,6 +378,7 @@ def _carry_from_run(run):
         "enc_state": copy.deepcopy(run.get("enc_state")),
         "commissions": copy.deepcopy(run.get("commissions", [])),
         "next_commission_seq": run.get("next_commission_seq", 1),
+        "coop_team": run.get("coop_team"),
         "chapter": run.get("chapter"),
         "chapters_total": run.get("chapters_total"),
     }
@@ -414,28 +440,42 @@ def _expedition_view(exp):
     }
 
 
+def _create_expedition_conn(conn, seed, total, coop_team_id=None):
+    """在调用方事务内创建远征 + 第 1 章 run + 双方日志（单人和协作共用）。
+
+    coop_team_id 非空（协作远征）时：章节 run 状态带 coop_team 标记（进入交接
+    快照与校验点，在线开章/回放重建共用 _new_run_state，逐位一致），远征记录
+    写 coop_team_id 列。返回 (exp_id, run_id, state, map_data)。
+    """
+    exp_id = uuid.uuid4().hex[:12]
+    run_id = uuid.uuid4().hex[:12]
+    state = _new_run_state(_chapter_seed(seed, 1), chapter=1,
+                           chapters_total=total, expedition_id=exp_id,
+                           coop_team=coop_team_id)
+    map_data = mapgen.generate_map(state["seed"])
+    db.insert_expedition(conn, exp_id, seed, total, run_id, coop_team_id=coop_team_id)
+    db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
+                  map_data, state, expedition_id=exp_id, chapter=1)
+    db.append_event_conn(conn, run_id, 1, "create", {
+        "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+        "expedition": exp_id, "chapter": 1, "chapters_total": total,
+        "coop_team": coop_team_id,
+    })
+    db.append_expedition_event_conn(conn, exp_id, 1, "create", {
+        "seed": seed, "chapters": total, "chapter": 1, "run_id": run_id,
+        "coop_team": coop_team_id,
+    })
+    return exp_id, run_id, state, map_data
+
+
 def create_expedition(seed=None, chapters=None):
     """创建远征：远征记录与第 1 章 run 在同一事务落库，绝不留下「无章节」的远征。"""
     seed = seed if seed is not None else random.randint(0, 2**31 - 1)
     total = chapters if chapters is not None else DEFAULT_CHAPTERS
     if not isinstance(total, int) or not (1 <= total <= MAX_CHAPTERS):
         raise InvalidAction(f"chapters must be 1..{MAX_CHAPTERS}")
-    exp_id = uuid.uuid4().hex[:12]
-    run_id = uuid.uuid4().hex[:12]
-    state = _new_run_state(_chapter_seed(seed, 1), chapter=1,
-                           chapters_total=total, expedition_id=exp_id)
-    map_data = mapgen.generate_map(state["seed"])
     with db.transaction() as conn:
-        db.insert_expedition(conn, exp_id, seed, total, run_id)
-        db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
-                      map_data, state, expedition_id=exp_id, chapter=1)
-        db.append_event_conn(conn, run_id, 1, "create", {
-            "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
-            "expedition": exp_id, "chapter": 1, "chapters_total": total,
-        })
-        db.append_expedition_event_conn(conn, exp_id, 1, "create", {
-            "seed": seed, "chapters": total, "chapter": 1, "run_id": run_id,
-        })
+        exp_id, run_id, state, map_data = _create_expedition_conn(conn, seed, total)
     exp = db.load_expedition(exp_id)
     return {
         "expedition": _expedition_view(exp),
@@ -451,7 +491,7 @@ def get_expedition(exp_id):
     return {"expedition": _expedition_view(exp), "run": resume(exp["current_run_id"])}
 
 
-def advance_expedition(exp_id, request_id=None):
+def advance_expedition(exp_id, request_id=None, member_id=None):
     """进入下一章：以当前章的交接快照开新章 run。
 
     防重复开章：
@@ -460,67 +500,101 @@ def advance_expedition(exp_id, request_id=None):
     - request_id 幂等：同一令牌重复/并发提交返回首次响应（duplicate:true），
       不会重复创建章节 run；
     - 远征记录、新章 run、双方日志在同一事务提交，任何写入失败整体回滚。
+
+    协作远征（2.9.0）：仅队长可推进（成员身份在事务内按入会令牌核实，越权
+    抛 PermissionDenied -> 403，且发生在任何状态变更之前）。
     """
     with db.run_lock(f"exp:{exp_id}"):
         with db.transaction() as conn:
-            prior = db.get_idempotent(conn, f"exp:{exp_id}", request_id)
-            if prior is not None:
-                cached = dict(prior["response"])
-                cached["duplicate"] = True
-                return cached
+            return _advance_expedition_conn(
+                conn, exp_id, request_id, member_id=member_id)
 
-            row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
-            if row is None:
-                raise InvalidAction("expedition not found")
-            if row["status"] != "in_progress":
-                # 已结算（won/lost）：不重复结算、不再开章
-                raise DuplicateReward(f"expedition already settled ({row['status']})")
-            cur = conn.execute("SELECT * FROM runs WHERE id=?",
-                               (row["current_run_id"],)).fetchone()
-            if cur is None:
-                raise InvalidAction("current chapter run not found")
-            if cur["status"] != "won":
-                raise InvalidAction("current chapter not cleared yet")
-            chapter = row["chapter"]
-            if chapter >= row["chapters_total"]:
-                raise InvalidAction("expedition already at final chapter")
 
-            nxt = chapter + 1
-            carry = _carry_from_run(json.loads(cur["state_json"]))
-            # 超期失败：进入第 nxt 章时限章早于 nxt 的进行中委托（可领奖的保留）
-            expired = commission_mod.expire_active(carry["commissions"], nxt)
-            run_id = uuid.uuid4().hex[:12]
-            state = _new_run_state(_chapter_seed(row["seed"], nxt), carry=carry,
-                                   chapter=nxt, chapters_total=row["chapters_total"],
-                                   expedition_id=exp_id)
-            map_data = mapgen.generate_map(state["seed"])
-            try:
-                db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
-                              map_data, state, expedition_id=exp_id, chapter=nxt)
-                db.append_event_conn(conn, run_id, 1, "create", {
-                    "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
-                    "expedition": exp_id, "chapter": nxt,
-                    "chapters_total": row["chapters_total"], "carry": carry,
-                })
-                seq = db.next_expedition_seq_conn(conn, exp_id)
-                db.append_expedition_event_conn(conn, exp_id, seq, "advance", {
-                    "chapter": nxt, "run_id": run_id, "carry": carry,
-                    "rest_heal": state["health"] - carry["health"],
-                    "expired": expired,
-                })
-                db.save_expedition_conn(conn, exp_id, "in_progress", nxt, run_id, carry,
-                                        expected_rev=row["rev"])
-            except db.ConcurrentModification as e:
-                raise StaleState(str(e))
+def _advance_expedition_conn(conn, exp_id, request_id, member_id=None):
+    """advance 的事务内实现（协作战队推进复用本函数，保证同一开章路径）。"""
+    prior = db.get_idempotent(conn, f"exp:{exp_id}", request_id)
+    if prior is not None:
+        cached = dict(prior["response"])
+        cached["duplicate"] = True
+        return cached
 
-            exp = db.load_expedition(exp_id)
-            response = {
-                "expedition": _expedition_view(exp),
-                "run": _public_view(state, map_data, run_id, rev=1, expedition=_exp_badge(exp)),
-                "duplicate": False,
-            }
-            db.put_idempotent(conn, f"exp:{exp_id}", request_id, seq, response)
-            return response
+    row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+    if row is None:
+        raise InvalidAction("expedition not found")
+    # 协作远征：推进是队长权限（校验先于任何状态变更）
+    team_id = row["coop_team_id"] if "coop_team_id" in row.keys() else None
+    actor = None
+    if team_id:
+        actor = _require_coop_member_conn(conn, team_id, member_id)
+        if actor["role"] != coop_mod.LEADER:
+            raise PermissionDenied("only the team leader can advance chapters")
+    if row["status"] != "in_progress":
+        # 已结算（won/lost）：不重复结算、不再开章
+        raise DuplicateReward(f"expedition already settled ({row['status']})")
+    cur = conn.execute("SELECT * FROM runs WHERE id=?",
+                       (row["current_run_id"],)).fetchone()
+    if cur is None:
+        raise InvalidAction("current chapter run not found")
+    if cur["status"] != "won":
+        raise InvalidAction("current chapter not cleared yet")
+    chapter = row["chapter"]
+    if chapter >= row["chapters_total"]:
+        raise InvalidAction("expedition already at final chapter")
+
+    nxt = chapter + 1
+    carry = _carry_from_run(json.loads(cur["state_json"]))
+    # 超期失败：进入第 nxt 章时限章早于 nxt 的进行中委托（可领奖的保留）
+    expired = commission_mod.expire_active(carry["commissions"], nxt)
+    run_id = uuid.uuid4().hex[:12]
+    state = _new_run_state(_chapter_seed(row["seed"], nxt), carry=carry,
+                           chapter=nxt, chapters_total=row["chapters_total"],
+                           expedition_id=exp_id, coop_team=team_id)
+    map_data = mapgen.generate_map(state["seed"])
+    try:
+        db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
+                      map_data, state, expedition_id=exp_id, chapter=nxt)
+        db.append_event_conn(conn, run_id, 1, "create", {
+            "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+            "expedition": exp_id, "chapter": nxt,
+            "chapters_total": row["chapters_total"], "carry": carry,
+            "coop_team": team_id,
+        })
+        seq = db.next_expedition_seq_conn(conn, exp_id)
+        db.append_expedition_event_conn(conn, exp_id, seq, "advance", {
+            "chapter": nxt, "run_id": run_id, "carry": carry,
+            "rest_heal": state["health"] - carry["health"],
+            "expired": expired,
+        })
+        db.save_expedition_conn(conn, exp_id, "in_progress", nxt, run_id, carry,
+                                expected_rev=row["rev"])
+    except db.ConcurrentModification as e:
+        raise StaleState(str(e))
+
+    # 协作远征：推进同步到队伍时间线（队员的客户端据此刻画章节切换）
+    coop_view = None
+    if team_id:
+        cseq = db.next_coop_seq_conn(conn, team_id)
+        db.append_coop_event_conn(conn, team_id, cseq, "advance", {
+            "chapter": nxt, "run_id": run_id, "rest_heal": state["health"] - carry["health"],
+            "expired": expired,
+            "actor": actor["id"] if actor else None,
+        })
+        team = db.load_coop_team_conn(conn, team_id)
+        members = db.list_coop_members_conn(conn, team_id)
+        coop_view = coop_mod.coop_badge(
+            team, members, nxt, row["chapters_total"], "in_progress",
+            me_id=actor["id"] if actor else None)
+
+    exp = db.load_expedition(exp_id)
+    badge = _exp_badge(exp)
+    response = {
+        "expedition": _expedition_view(exp),
+        "run": _public_view(state, map_data, run_id, rev=1, expedition=badge,
+                            coop=coop_view),
+        "duplicate": False,
+    }
+    db.put_idempotent(conn, f"exp:{exp_id}", request_id, seq, response)
+    return response
 
 
 def _ensure_expedition_fields_conn(conn, run, rec):
@@ -859,6 +933,528 @@ def expedition_replay(exp_id):
     }
 
 
+# ==================================================================
+# 多人协作远征（2.9.0）：组队大厅 / 权限边界 / 队伍奖励 / 整程回放
+# ==================================================================
+def _gen_id(prefix="", n=12):
+    return prefix + uuid.uuid4().hex[:n]
+
+
+def _gen_token():
+    return uuid.uuid4().hex + uuid.uuid4().hex[:8]  # 40 位入会令牌
+
+
+def _require_forming_team_conn(conn, team_id):
+    team = db.load_coop_team_conn(conn, team_id) if team_id else None
+    if team is None:
+        raise InvalidAction("team not found")
+    return team
+
+
+def _require_team_member_conn(conn, team_id, member_id):
+    """按成员 id 核实「该成员属于这支队伍」；不属于/不存在 -> 403。"""
+    member = db.get_coop_member_conn(conn, team_id, member_id) if member_id else None
+    if member is None:
+        raise PermissionDenied("member identity required")
+    return member
+
+
+def _require_leader_conn(conn, team, member_id):
+    member = _require_team_member_conn(conn, team["id"], member_id)
+    if member["id"] != team["leader_id"] or member["role"] != coop_mod.LEADER:
+        raise PermissionDenied("team leader only")
+    return member
+
+
+def _require_coop_member_conn(conn, team_id, member_id):
+    """协作远征管理动作（advance）的身份核验：令牌有效且属于该队伍。"""
+    return _require_team_member_conn(conn, team_id, member_id)
+
+
+def _authorize_coop_action_conn(conn, run, rec, action, member_id):
+    """章节 run 行动的协作权限边界（必须在纯推演之前调用）。
+
+    - 单人远征/普通局（无 coop_team）：直接放行，不要求成员身份；
+    - 协作远征：成员必须属于该队伍、队伍已开赛，且角色对该动作领域有权限
+      （战斗位只能战斗动作，资源位只能资源动作，队长两者皆可）；
+    - 越权/未带身份/他队成员一律 PermissionDenied（403），发生在任何状态
+      变更之前，事务随异常整体回滚 -> 零副作用。
+    返回成员记录（非协作 run 返回 None）。
+    """
+    team_id = run.get("coop_team")
+    if not team_id:
+        return None
+    team = db.load_coop_team_conn(conn, team_id)
+    if team is None:
+        # 状态属于某队但队伍记录缺失（异常档）：拒绝写入而非放任越权
+        raise PermissionDenied("coop team record missing")
+    member = _require_team_member_conn(conn, team_id, member_id)
+    if team["status"] != "started":
+        raise PermissionDenied("team expedition has not started")
+    if not coop_mod.can_perform(member["role"], action):
+        kind = coop_mod.action_kind(action)
+        domain = "战斗" if kind == "battle" else "资源" if kind == "resource" else "该"
+        raise PermissionDenied(
+            f"{coop_mod.role_label(member['role'])}无权提交{domain}动作「{action}」")
+    return member
+
+
+def _append_ledger_conn(conn, team_id, member_id, kind, amount, chapter, detail):
+    """记一条个人战利/贡献流水（amount=0 也允许：贡献计数用）。"""
+    lseq = db.next_ledger_seq_conn(conn, team_id)
+    db.append_ledger_conn(conn, team_id, lseq, member_id, kind, amount, chapter,
+                          detail or {})
+
+
+def _append_team_event_conn(conn, team_id, kind, payload):
+    seq = db.next_coop_seq_conn(conn, team_id)
+    db.append_coop_event_conn(conn, team_id, seq, kind, payload)
+    return seq
+
+
+def _coop_badge_conn(conn, team, me_id=None):
+    """构造随 run 视口下发的协作摘要（成员角色/本成员权限边界）。"""
+    members = db.list_coop_members_conn(conn, team["id"])
+    exp_status = "in_progress"
+    chapter = 1
+    if team.get("expedition_id"):
+        exp = db.load_expedition(team["expedition_id"])
+        if exp is not None:
+            exp_status = exp["status"]
+            chapter = exp["chapter"]
+    return coop_mod.coop_badge(team, members, chapter,
+                               team.get("chapters_total") or 1, exp_status, me_id=me_id)
+
+
+def _coop_ledger_summary_conn(conn, team_id):
+    """个人战利汇总：member_id -> {battle_wins, resource_ops, gold（个人名义金）}。"""
+    rows = db.list_coop_ledger_conn(conn, team_id)
+    summary = {}
+    for r in rows:
+        s = summary.setdefault(r["member_id"], {
+            "battle_wins": 0, "resource_ops": 0, "gold": 0,
+            "chapter_bonus": 0, "win_bonus": 0})
+        if r["kind"] == coop_mod.C_BATTLE:
+            s["battle_wins"] += 1
+        elif r["kind"] == coop_mod.C_RESOURCE:
+            s["resource_ops"] += 1
+        elif r["kind"] == coop_mod.C_CHAPTER:
+            s["chapter_bonus"] += r["amount"]
+            s["gold"] += r["amount"]
+        elif r["kind"] == coop_mod.C_WIN:
+            s["win_bonus"] += r["amount"]
+            s["gold"] += r["amount"]
+    return summary
+
+
+def _team_view_conn(conn, team, me_id=None, with_ledger=True):
+    """队伍全量视口：大厅轮询与结算/回放入口共用。"""
+    members = db.list_coop_members_conn(conn, team["id"])
+    view = coop_mod.team_public(team, members, me_id=me_id)
+    if with_ledger:
+        summary = _coop_ledger_summary_conn(conn, team["id"])
+        for m in view["members"]:
+            m["ledger"] = summary.get(m["id"], {
+                "battle_wins": 0, "resource_ops": 0, "gold": 0,
+                "chapter_bonus": 0, "win_bonus": 0})
+        view["events"] = db.load_coop_events(team["id"])
+    return view
+
+
+def create_coop_team(name=None, captain_name=None, seed=None, chapters=None):
+    """队长组建队伍：生成入队码（6 位）与队长入会令牌，队伍处于 forming。
+
+    队长自身就是第一名成员（joined_seq=1）；开赛之前队员可凭入队码加入，
+    队长可分配战斗位/资源位。所有写入在一个事务内完成。
+    """
+    seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+    total = chapters if chapters is not None else DEFAULT_CHAPTERS
+    if not isinstance(total, int) or not (1 <= total <= MAX_CHAPTERS):
+        raise InvalidAction(f"chapters must be 1..{MAX_CHAPTERS}")
+    cap_name = _clean_name(captain_name, default="队长")
+    team_name = _clean_name(name, default=f"{cap_name}的远征队",
+                            max_len=coop_mod.TEAM_NAME_MAX)
+    team_id = _gen_id("t_")
+    leader_id = _gen_id("m_", 10)
+    token = _gen_token()
+    with db.run_lock(f"coop:create:{team_id}"):
+        with db.transaction() as conn:
+            code = coop_mod.unique_join_code(db.list_all_join_codes_conn(conn))
+            db.insert_coop_team_conn(conn, team_id, code, leader_id, name=team_name,
+                                     seed=seed, chapters_total=total)
+            db.insert_coop_member_conn(conn, leader_id, team_id, token, cap_name,
+                                       coop_mod.LEADER, joined_seq=1)
+            _append_team_event_conn(conn, team_id, "form", {
+                "team": team_id, "code": code, "name": team_name,
+                "leader": {"id": leader_id, "name": cap_name},
+                "seed": seed, "chapters": total,
+            })
+            team = db.load_coop_team_conn(conn, team_id)
+            return _team_view_conn(conn, team, me_id=leader_id)
+
+
+def join_coop_team(code, member_name, request_id=None):
+    """队员凭入队码加入队伍（仅 forming、未满员）。返回带本人 token 的队伍视口。"""
+    code = (code or "").strip().upper()
+    if not code:
+        raise InvalidAction("join code required")
+    name = _clean_name(member_name, default="队员")
+    with db.run_lock(f"coop:code:{code}"):
+        with db.transaction() as conn:
+            team = db.load_coop_team_by_code_conn(conn, code)
+            if team is None:
+                raise InvalidAction("invalid join code")
+            prior = db.get_coop_idempotent_conn(conn, team["id"], request_id)
+            if prior is not None:
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+            if team["status"] != "forming":
+                raise InvalidAction("team already started or disbanded")
+            members = db.list_coop_members_conn(conn, team["id"])
+            if len(members) >= coop_mod.MAX_MEMBERS:
+                raise InvalidAction("team is full")
+            if any(m["name"] == name for m in members):
+                raise DuplicateReward("a member with that name is already in the team")
+            member_id = _gen_id("m_", 10)
+            token = _gen_token()
+            # 新队员默认战斗位（队长可在开赛前改成资源位）
+            db.insert_coop_member_conn(conn, member_id, team["id"], token, name,
+                                       coop_mod.COMBAT, joined_seq=len(members) + 1)
+            _append_team_event_conn(conn, team["id"], "join", {
+                "member": {"id": member_id, "name": name, "role": coop_mod.COMBAT}})
+            seq = db.next_coop_seq_conn(conn, team["id"]) - 1
+            team = db.load_coop_team_conn(conn, team["id"])
+            response = _team_view_conn(conn, team, me_id=member_id)
+            db.put_coop_idempotent_conn(conn, team["id"], request_id, seq, response)
+            return response
+
+
+def get_coop_team(team_id, member_id=None):
+    """队伍视口（大厅轮询/赛后查看）：成员列表、角色、个人战利、时间线。"""
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = db.load_coop_team_conn(conn, team_id)
+            if team is None:
+                raise InvalidAction("team not found")
+            # 携带 member_id 时仅用于高亮“我”，不作为硬鉴权（大厅分享链接可读）
+            return _team_view_conn(conn, team, me_id=member_id)
+
+
+def assign_role(team_id, member_id, target_id, role, request_id=None):
+    """队长为队员分配战斗位/资源位（仅 forming 阶段；队长身份不可更改）。"""
+    if role not in coop_mod.ASSIGNABLE_ROLES:
+        raise InvalidAction("role must be combat or supply")
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = _require_forming_team_conn(conn, team_id)
+            leader = _require_leader_conn(conn, team, member_id)
+            prior = db.get_coop_idempotent_conn(conn, team_id, request_id)
+            if prior is not None:
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+            if team["status"] != "forming":
+                raise InvalidAction("roles can only be changed before the run starts")
+            target = db.get_coop_member_conn(conn, team_id, target_id)
+            if target is None:
+                raise InvalidAction("member not found")
+            if target["role"] == coop_mod.LEADER:
+                raise PermissionDenied("cannot change the leader's role")
+            if target["role"] == role:
+                raise DuplicateReward(f"member already assigned to {role}")
+            old_role = target["role"]
+            db.update_coop_member_role_conn(conn, team_id, target_id, role)
+            _append_team_event_conn(conn, team_id, "role", {
+                "by": leader["id"], "member": target_id,
+                "from": old_role, "to": role})
+            seq = db.next_coop_seq_conn(conn, team_id) - 1
+            team = db.load_coop_team_conn(conn, team_id)
+            response = _team_view_conn(conn, team, me_id=member_id)
+            db.put_coop_idempotent_conn(conn, team_id, request_id, seq, response)
+            return response
+
+
+def leave_team(team_id, member_id, request_id=None):
+    """队员在开赛前退出（队长退出即解散整队）。"""
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = _require_forming_team_conn(conn, team_id)
+            member = _require_team_member_conn(conn, team_id, member_id)
+            prior = db.get_coop_idempotent_conn(conn, team_id, request_id)
+            if prior is not None:
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+            if team["status"] != "forming":
+                raise InvalidAction("cannot leave after the expedition has started")
+            is_leader = member["id"] == team["leader_id"]
+            if is_leader:
+                return _disband_team_conn(conn, team, reason="leader_left")
+            db.delete_coop_member_conn(conn, team_id, member_id)
+            _append_team_event_conn(conn, team_id, "leave", {"member": member_id})
+            seq = db.next_coop_seq_conn(conn, team_id) - 1
+            team = db.load_coop_team_conn(conn, team_id)
+            response = {"left": True, "team": _team_view_conn(conn, team)}
+            db.put_coop_idempotent_conn(conn, team_id, request_id, seq, response)
+            return response
+
+
+def disband_team(team_id, member_id, request_id=None):
+    """队长在开赛前解散队伍。"""
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = _require_forming_team_conn(conn, team_id)
+            _require_leader_conn(conn, team, member_id)
+            prior = db.get_coop_idempotent_conn(conn, team_id, request_id)
+            if prior is not None:
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+            return _disband_team_conn(conn, team, reason="disbanded")
+
+
+def _disband_team_conn(conn, team, reason):
+    """事务内解散：移除全部成员、队伍置 disbanded（开赛后永远走不到这里）。"""
+    members = db.list_coop_members_conn(conn, team["id"])
+    for m in members:
+        db.delete_coop_member_conn(conn, team["id"], m["id"])
+    db.save_coop_team_conn(conn, team["id"], status="disbanded")
+    _append_team_event_conn(conn, team["id"], "disband", {"reason": reason})
+    return {"disbanded": True, "reason": reason}
+
+
+def start_coop_expedition(team_id, member_id, request_id=None):
+    """队长开赛：校验人数 -> 与普通远征同路径创建第 1 章 run（单事务）。
+
+    队伍 forming -> started 与远征/章节 run/双方日志在同一事务原子提交，
+    request_id 幂等（双击只开赛一次），expected_rev 由队伍 rev 守卫
+    （大厅里并发的角色调整不会与开赛互相覆盖）。返回 {team, expedition, run}。
+    """
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = _require_forming_team_conn(conn, team_id)
+            leader = _require_leader_conn(conn, team, member_id)
+            prior = db.get_coop_idempotent_conn(conn, team_id, request_id)
+            if prior is not None:
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+            if team["status"] != "forming":
+                raise DuplicateReward("team expedition already started")
+            members = db.list_coop_members_conn(conn, team_id)
+            if len(members) < coop_mod.MIN_START_MEMBERS:
+                raise InvalidAction(
+                    f"at least {coop_mod.MIN_START_MEMBERS} members are required to start")
+            # 与单人远征完全相同的开章路径（仅多带 coop_team_id），保证
+            # 章节状态/交接快照/校验点/回放走同一条链路。
+            exp_id, run_id, state, map_data = _create_expedition_conn(
+                conn, team["seed"], team["chapters_total"], coop_team_id=team_id)
+            try:
+                db.bind_expedition_to_team_conn(
+                    conn, team_id, exp_id, team["seed"], team["chapters_total"],
+                    expected_rev=team["rev"])
+            except db.ConcurrentModification as e:
+                raise StaleState(str(e))
+            _append_team_event_conn(conn, team_id, "start", {
+                "expedition": exp_id, "run_id": run_id,
+                "chapters": team["chapters_total"],
+                "members": [{"id": m["id"], "name": m["name"], "role": m["role"]}
+                            for m in members],
+                "by": leader["id"],
+            })
+            exp = db.load_expedition(exp_id)
+            team = db.load_coop_team_conn(conn, team_id)
+            coop_view = _coop_badge_conn(conn, team, me_id=member_id)
+            seq = db.next_coop_seq_conn(conn, team_id) - 1
+            response = {
+                "team": _team_view_conn(conn, team, me_id=member_id),
+                "expedition": _expedition_view(exp),
+                "run": _public_view(state, map_data, run_id, rev=1,
+                                    expedition=_exp_badge(exp), coop=coop_view),
+                "duplicate": False,
+            }
+            db.put_coop_idempotent_conn(conn, team_id, request_id, seq, response)
+            return response
+
+
+def advance_coop_expedition(team_id, member_id, request_id=None):
+    """队长推进协作远征章节：复用 _advance_expedition_conn 的同一开章路径。"""
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = db.load_coop_team_conn(conn, team_id)
+            if team is None:
+                raise InvalidAction("team not found")
+            if not team.get("expedition_id"):
+                raise InvalidAction("team expedition has not started")
+            # 队长身份先于推进校验（advance 内部还会按队伍再核一次权限）
+            _require_leader_conn(conn, team, member_id)
+            return _advance_expedition_conn(
+                conn, team["expedition_id"], request_id, member_id=member_id)
+
+
+def get_coop_expedition(team_id, member_id=None):
+    """协作远征续局入口：队伍视口 + 当前章节 run 视口（携带权限边界）。
+
+    注意：resume 自身会开启共享连接事务，不能在外层事务里调用（单连接不可
+    嵌套）；这里只在短事务里读队伍/远征索引，事务结束后再 resume 当前章节。
+    """
+    with db.run_lock(f"coop:{team_id}"):
+        with db.transaction() as conn:
+            team = db.load_coop_team_conn(conn, team_id)
+            if team is None:
+                raise InvalidAction("team not found")
+            if not team.get("expedition_id"):
+                # 尚未开赛：只返回大厅视口
+                return {"team": _team_view_conn(conn, team, me_id=member_id),
+                        "expedition": None, "run": None}
+            exp = db.load_expedition(team["expedition_id"])
+            if exp is None:
+                raise InvalidAction("expedition not found")
+            current_run_id = exp["current_run_id"]
+            team_view = _team_view_conn(conn, team, me_id=member_id)
+            expedition_view = _expedition_view(exp)
+        # 事务已提交：resume 走它自己的迁移事务（coop 摘要在其中构造）
+        run_view = resume(current_run_id, member_id=member_id)
+        return {"team": team_view, "expedition": expedition_view, "run": run_view}
+
+
+# ---------- 协作记账（在 act 的同一事务内调用） ----------
+def _sync_coop_conn(conn, member, rec, run, action, action_body, log, ended_before):
+    """协作贡献/战利记账 + 队伍状态同步（与章节 run 同一事务）。
+
+    触发点（只在 run 状态实际发生的动作上记账，重复/越权在更上层已被拦截）：
+    - 战斗动作且本步战斗胜利 -> 操作者 +1 讨伐贡献；
+    - 任意资源动作 -> 操作者 +1 后勤贡献；
+    - 章节首领击败（run: in_progress -> won）-> 给当时在册成员均分章节名义金；
+      若为终章，再均分终胜名义金；同时追加队伍 chapter_clear/settle 事件；
+    - 章节战败（-> lost）-> 追加队伍 settle(lost) 事件，不发名义金。
+    返回随响应下发的协作摘要。个人流水不进 run 状态，因此不影响逐位校验点；
+    共享章节状态（含协作金）的变化已经在纯推演里完成并哈希。
+    """
+    team_id = run.get("coop_team")
+    if not team_id:
+        return None
+    team = db.load_coop_team_conn(conn, team_id)
+    if team is None:
+        return None
+    chapter = run.get("chapter") or rec.get("chapter") or 1
+    members = db.list_coop_members_conn(conn, team_id)
+
+    # 1) 个人贡献：战斗胜利 / 后勤操作
+    kind = coop_mod.action_kind(action)
+    won_this_step = any(isinstance(x, dict) and x.get("result") in ("won", "run_won")
+                        for x in (log or []))
+    detail = {"action": action, "node": run.get("position"), "chapter": chapter}
+    if kind == "battle":
+        # 只有真正打完并胜利的战斗动作记一次讨伐（进行中的出牌/回合不记）
+        result = _step_result(log or [])
+        if result in ("won", "run_won"):
+            _append_ledger_conn(conn, team_id, member["id"],
+                                coop_mod.C_BATTLE, 0, chapter, detail)
+    elif kind == "resource":
+        _append_ledger_conn(conn, team_id, member["id"],
+                            coop_mod.C_RESOURCE, 0, chapter, detail)
+
+    # 2) 章节通关/战败结算：仅当本步把 run 从进行中带到终态时处理一次
+    if not ended_before and run["status"] in ("won", "lost"):
+        is_final = chapter >= (run.get("chapters_total") or chapter)
+        row = conn.execute("SELECT * FROM expeditions WHERE id=?",
+                           (rec.get("expedition_id"),)).fetchone()
+        exp_status = row["status"] if row is not None else run["status"]
+        if run["status"] == "won":
+            # 章节通关名义金：给击败首领时在册的成员确定性均分（共享池那份
+            # 协作金已在纯推演里加过；这里只发个人名义记录，不重复加 gold）。
+            shares = coop_mod.split_bonus(coop_mod.CHAPTER_CLEAR_BONUS, members)
+            for m in members:
+                amount = shares.get(m["id"], 0)
+                _append_ledger_conn(conn, team_id, m["id"], coop_mod.C_CHAPTER,
+                                    amount, chapter,
+                                    {"shared_bonus": coop_mod.CHAPTER_CLEAR_BONUS,
+                                     "final": is_final})
+            event_payload = {
+                "chapter": chapter, "run_id": rec["id"], "final": is_final,
+                "shared_bonus": coop_mod.CHAPTER_CLEAR_BONUS,
+                "shares": shares, "by": member["id"],
+            }
+            if is_final:
+                # 终胜：额外的终程名义奖励（不入共享池，队伍已结算）
+                win_shares = coop_mod.split_bonus(coop_mod.FINAL_WIN_BONUS, members)
+                for m in members:
+                    _append_ledger_conn(conn, team_id, m["id"], coop_mod.C_WIN,
+                                        win_shares.get(m["id"], 0), chapter,
+                                        {"final_win": True})
+                event_payload["win_bonus"] = coop_mod.FINAL_WIN_BONUS
+                event_payload["win_shares"] = win_shares
+                _append_team_event_conn(conn, team_id, "settle",
+                                        {"result": "won", **event_payload})
+            else:
+                _append_team_event_conn(conn, team_id, "chapter_clear", event_payload)
+        else:
+            _append_team_event_conn(conn, team_id, "settle", {
+                "result": "lost", "chapter": chapter, "run_id": rec["id"],
+                "by": member["id"],
+            })
+
+    return _coop_badge_conn(conn, team, me_id=member["id"])
+
+
+def coop_team_replay(team_id):
+    """协作远征整程回放：队伍时间线（含个人战利）+ 远征事件 + 逐章可交互回放。
+
+    复用 expedition_replay 的逐章重建（校验点逐位比对），并在每一步上叠加
+    battle_events 里记录的 actor（操作者）；全程只读，不写任何存档/不发解锁。
+    """
+    team_rec = db.load_coop_team(team_id)
+    if team_rec is None:
+        raise InvalidAction("team not found")
+    # 只读连接：整程回放绝不开启写事务（与 expedition_replay 的只读隔离一致）
+    conn = db.get_conn()
+    try:
+        members = db.list_coop_members_conn(conn, team_id)
+        ledger_rows = db.list_coop_ledger_conn(conn, team_id)
+    finally:
+        conn.close()
+    member_by_id = {m["id"]: {"id": m["id"], "name": m["name"], "role": m["role"],
+                              "role_label": coop_mod.role_label(m["role"])}
+                     for m in members}
+    exp_replay = None
+    exp = None
+    if team_rec.get("expedition_id"):
+        exp = db.load_expedition(team_rec["expedition_id"])
+        exp_replay = expedition_replay(team_rec["expedition_id"])
+        # 把每一步的操作者标注到章节回放帧上（只读派生，不改底层结构）
+        for ch in exp_replay.get("chapters", []):
+            for step in ch["replay"].get("steps", []):
+                actor_id = (step.get("payload") or {}).get("actor")
+                step["actor"] = member_by_id.get(actor_id)
+    ledger_public = []
+    members_by_id = {m["id"]: m for m in members}
+    for r in ledger_rows:
+        m = members_by_id.get(r["member_id"], {})
+        ledger_public.append({**r, "member_name": m.get("name"),
+                              "member_role": m.get("role")})
+    return {
+        "team": coop_mod.team_public(team_rec, members),
+        "members": list(member_by_id.values()),
+        "events": db.load_coop_events(team_id),
+        "ledger": ledger_public,
+        "expedition": _expedition_view(exp) if exp is not None else None,
+        "expedition_events": (db.load_expedition_events(team_rec["expedition_id"])
+                              if team_rec.get("expedition_id") else []),
+        "expedition_replay": exp_replay,
+        "isolated": True,
+    }
+
+
+def _clean_name(value, default, max_len=coop_mod.MEMBER_NAME_MAX):
+    """成员/队伍名规整：去空白、限长、非法时用默认名。"""
+    text = (value or "").strip()
+    if not text:
+        return default
+    return text[:max_len]
+
+
 def _require_run(run_id):
     run = db.load_run(run_id)
     if run is None:
@@ -966,7 +1562,7 @@ class StaleState(Exception):
     pass
 
 
-def act(run_id, action):
+def act(run_id, action, member_id=None):
     """在线行动：加锁 -> 校验/幂等 -> 纯状态推演（无 DB）-> 单事务原子提交。
 
     纯推演部分（_apply_action）与回放共享同一条代码路径，保证“玩的时候”
@@ -1019,6 +1615,10 @@ def act(run_id, action):
             if _repair_expedition_chapter_run_conn(conn, run, rec):
                 migrated = True
             ended_before = run["status"] != "in_progress"
+            # 2.9.0：协作远征权限边界——身份核验与角色授权必须在【任何状态变更
+            # 之前】完成（纯推演在下一段）。越权抛 PermissionDenied -> 403，
+            # 事务随异常整体回滚，零副作用。
+            coop_member = _authorize_coop_action_conn(conn, run, rec, a, member_id)
             # 章节已通关（won）但远征尚未推进时，仍允许领取已完成委托（领奖后再开新章）；
             # 其余情况下结束的 run 不再接受行动。
             if run["status"] != "in_progress" and not (
@@ -1041,6 +1641,9 @@ def act(run_id, action):
                 "mode": action.get("mode"),
                 "chain": action.get("chain"),
                 "enc_choice": action.get("enc_choice"),
+                # 2.9.0：协作远征每步记录操作者（单人远征为 None），供整程回放标注
+                "actor": coop_member["id"] if coop_member else None,
+                "actor_role": coop_member["role"] if coop_member else None,
                 "ver": RULES_VERSION, "ckpt": state_checkpoint(run),
             }
             if migrated:
@@ -1069,8 +1672,15 @@ def act(run_id, action):
                 if exp is not None:
                     exp_badge = _exp_badge(exp)
 
+            # 2.9.0 协作远征：贡献/战利记账 + 队伍时间线（与上面同事务，失败一起回滚）
+            coop_view = None
+            if coop_member is not None:
+                coop_view = _sync_coop_conn(
+                    conn, coop_member, rec, run, a, action, log, ended_before)
+
             response = {"seq": seq, "log": log,
-                        "run": _public_view(run, map_data, run_id, expedition=exp_badge),
+                        "run": _public_view(run, map_data, run_id, expedition=exp_badge,
+                                            coop=coop_view),
                         "rev": rec["rev"] + 1, "duplicate": False}
             db.put_idempotent(conn, run_id, request_id, seq, response)
             return response
@@ -1596,6 +2206,18 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
             run["reward_options"] = []
             run["reward_claimed"] = True
             log.append({"result": "run_won"})
+            # 2.9.0 协作远征：击败章节首领（终章同）的协作金入【共享金币池】，
+            # 随交接快照带入下一章。纯推演、进 run 校验点——在线与回放同路径，
+            # 个人名义均分（coop_ledger）由事务层 _sync_coop_conn 在结算时记账，
+            # 不进 run 状态，不影响逐位哈希。
+            if run.get("coop_team"):
+                run["gold"] += coop_mod.CHAPTER_CLEAR_BONUS
+                log.append({"coop_chapter_bonus": {
+                    "amount": coop_mod.CHAPTER_CLEAR_BONUS,
+                    "gold_total": run["gold"],
+                    "chapter": run.get("chapter") or 1,
+                    "final": (run.get("chapter") or 1) >= (run.get("chapters_total") or 1),
+                }})
     else:
         run["battle"] = None
         run["status"] = "lost"
@@ -2030,7 +2652,7 @@ def all_cards_locked():
 
 
 # ---------- 视口 ----------
-def resume(run_id):
+def resume(run_id, member_id=None):
     # 旧档兼容迁移与读改写同一把锁/事务：并发续局或“续局与首行动撞车”时
     # 不会发生两次迁移互相覆盖（迁移结果与日志一起原子落库）。
     with db.run_lock(run_id):
@@ -2058,11 +2680,23 @@ def resume(run_id):
                 rev = row["rev"]
             # 远征章节 run：视口携带远征摘要（章节进度/结算状态）
             exp_badge = None
+            coop_badge_view = None
             if row["expedition_id"]:
                 exp = db.load_expedition(row["expedition_id"])
                 if exp is not None:
                     exp_badge = _exp_badge(exp)
-            return _public_view(state, map_data, run_id, rev=rev, expedition=exp_badge)
+                    # 2.9.0 协作远征：携带队伍摘要与本成员的权限边界（读接口，
+                    # member_id 仅用于高亮“我是谁”，不做硬鉴权；写动作才鉴权）
+                    team_id = exp.get("coop_team_id") or state.get("coop_team")
+                    if team_id:
+                        team = db.load_coop_team_conn(conn, team_id)
+                        if team is not None:
+                            members = db.list_coop_members_conn(conn, team_id)
+                            coop_badge_view = coop_mod.coop_badge(
+                                team, members, exp["chapter"], exp["chapters_total"],
+                                exp["status"], me_id=member_id)
+            return _public_view(state, map_data, run_id, rev=rev, expedition=exp_badge,
+                                coop=coop_badge_view)
 
 
 # ---------- 规则版本与校验点 ----------
@@ -2083,12 +2717,12 @@ _CKPT_SKIP_KEYS = {
 
 
 def state_checkpoint(run, include_companion=True, include_potions=True,
-                     include_encounters=True):
+                     include_encounters=True, include_coop=True):
     """权威状态校验点：对完整 run 状态取稳定哈希（SHA-256 截断 16 位）。
 
     include_*=False 仅用于旧规则升级时的历史初态/迁移前哈希兼容：
     2.8.0 之前的 create 状态没有 enc_state，重放旧 create 事件时按
-    include_encounters=False 比对。
+    include_encounters=False 比对；2.9.0 之前没有 coop_team，同维再剥一层。
     """
     skip = set(_CKPT_SKIP_KEYS)
     if not include_companion:
@@ -2097,6 +2731,8 @@ def state_checkpoint(run, include_companion=True, include_potions=True,
         skip.add("potions")
     if not include_encounters:
         skip.add("enc_state")
+    if not include_coop:
+        skip.add("coop_team")
     material = {k: v for k, v in run.items() if k not in skip}
     blob = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -2115,16 +2751,18 @@ def _create_ckpt_candidates(seed, create_payload):
     total = create_payload.get("chapters_total")
     sim = _new_run_state(
         seed, carry=carry, chapter=chapter, chapters_total=total,
-        expedition_id=create_payload.get("expedition"))
+        expedition_id=create_payload.get("expedition"),
+        coop_team=create_payload.get("coop_team"))
     # 状态内的 rules_version 标签在旧版本建局时就是旧串（在线修复不改写它）；
     # 用 create 事件记录的 ver 还原标签，旧存档哈希才能逐位比对（新档 ver 即当前版）。
     recorded_ver = create_payload.get("ver")
     if recorded_ver:
         sim["rules_version"] = recorded_ver
 
-    def _ckpt(state, comp, pot, enc):
+    def _ckpt(state, comp, pot, enc, coop):
         return state_checkpoint(state, include_companion=comp,
-                                include_potions=pot, include_encounters=enc)
+                                include_potions=pot, include_encounters=enc,
+                                include_coop=coop)
 
     buggy = None
     if carry is not None and chapter is not None and chapter > 1:
@@ -2135,37 +2773,37 @@ def _create_ckpt_candidates(seed, create_payload):
             expedition_id=create_payload.get("expedition"))
         if recorded_ver:
             buggy["rules_version"] = recorded_ver
-    # 八种「字段形状」候选：companion（2.6.0）/potions（2.5.0）/encounters（2.8.0）
-    # 三个结构维各自是否参与哈希。录制的 create ckpt 命中哪种形状，本 run 回放
-    # 起点就按哪种形状对齐——旧版初态哈希逐位可比，首个当前版本动作之前按 legacy。
-    # 顺序至关重要：优先尝试「完整形状」，再逐维剥字段。否则一个字段齐全的哈希
-    # 可能恰好（结构等价/空默认值）与某个缺字段形状碰撞，导致 2.8.0 新档被误判
-    # 成「奇遇字段尚未引入」，后续每步的 enc_state 都被错误地排除出哈希。
+    # 16 种「字段形状」候选：companion（2.6.0）/potions（2.5.0）/encounters（2.8.0）
+    # /coop（2.9.0）四个结构维各自是否参与哈希。录制的 create ckpt 命中哪种形状，
+    # 本 run 回放起点就按哪种形状对齐——旧版初态哈希逐位可比，首个当前版本动作
+    # 之前按 legacy。顺序至关重要：优先尝试「完整形状」，再逐维剥字段（coop 维在
+    # 最内层，保证旧版本候选只是新版候选的后缀）。
     shapes = []
-    for enc in (True, False):
-        for pot in (True, False):
-            for comp in (True, False):
-                name = ("full" if comp and pot and enc
-                        else f"c{int(comp)}p{int(pot)}e{int(enc)}")
-                buggy_hash = _ckpt(buggy, comp, pot, enc) if buggy is not None else None
-                shapes.append((name, comp, pot, enc, buggy_hash,
-                               _ckpt(sim, comp, pot, enc)))
+    for coop in (True, False):
+        for enc in (True, False):
+            for pot in (True, False):
+                for comp in (True, False):
+                    name = ("full" if comp and pot and enc and coop
+                            else f"c{int(comp)}p{int(pot)}e{int(enc)}o{int(coop)}")
+                    buggy_hash = _ckpt(buggy, comp, pot, enc, coop) if buggy is not None else None
+                    shapes.append((name, comp, pot, enc, coop, buggy_hash,
+                                   _ckpt(sim, comp, pot, enc, coop)))
     recorded = create_payload.get("ckpt") if not create_payload.get("_corrupt") else None
     matched = shapes[0]  # 默认 full
     if recorded is not None:
         for shape in shapes:
-            if recorded in (shape[4], shape[5]):
+            if recorded in (shape[5], shape[6]):
                 matched = shape
                 break
-    # 返回的三个布尔是「字段缺席」（pre-version，与既有 pre_companion/pre_potions
-    # 语义一致）：True 表示该 create 形状里没有该字段、首个新版动作之前按 legacy。
-    _name, has_companion, has_potions, has_enc, matched_buggy_ckpt, _ = matched
+    # 返回的布尔是「字段缺席」（pre-version，与既有 pre_* 语义一致）：True 表示
+    # 该 create 形状里没有该字段、首个新版动作之前按 legacy。
+    _name, has_companion, has_potions, has_enc, has_coop, matched_buggy_ckpt, _ = matched
     # create 帧实际比对值：录制值命中任一候选形状时直接用它（旧形状 create 帧
     # 因此可标记 ok；受影响章的 create 由 create_of_legacy 另行豁免），录制值
     # 缺失/全不匹配（损坏或规则漂移）时用完整形状哈希，让比对暴露 mismatch。
-    fixed_ckpt = recorded if recorded is not None else _ckpt(sim, True, True, True)
+    fixed_ckpt = recorded if recorded is not None else _ckpt(sim, True, True, True, True)
     return (sim, fixed_ckpt, matched_buggy_ckpt,
-            not has_companion, not has_potions, not has_enc)
+            not has_companion, not has_potions, not has_enc, not has_coop)
 
 
 def _replay_commission_maps(conn, exp_id, run_id):
@@ -2247,16 +2885,19 @@ def replay(run_id):
     )
     # 修复后正确初态 + 旧版错误初态两个候选：用记录的 create ckpt 识别受影响旧日志
     (sim, initial_ckpt, buggy_ckpt,
-     pre_companion_create, pre_potions_create, pre_enc_create) = _create_ckpt_candidates(
+     pre_companion_create, pre_potions_create, pre_enc_create,
+     pre_coop_create) = _create_ckpt_candidates(
         seed, create_payload)
     recorded_initial = (create_payload.get("ckpt")
                         if not create_payload.get("_corrupt") else None)
     pre_companion_replay = pre_companion_create
     pre_potions_replay = pre_potions_create
     pre_enc_replay = pre_enc_create
+    pre_coop_replay = pre_coop_create
     companion_migration_seen = not pre_companion_replay
     potions_migration_seen = not pre_potions_replay
     enc_migration_seen = not pre_enc_replay
+    coop_migration_seen = not pre_coop_replay
     # 2.7.0 格挡/援护顺序修复：无存档结构变更，create 形状无法区分新旧——
     # 统一按「首个 2.7.0+ 动作之前为旧时序」处理。在线路径上旧战斗中存档
     # 在玩家回合边界落库，升级后的首个动作（可能直接就是 end_turn）即按新
@@ -2349,14 +2990,19 @@ def replay(run_id):
         crossing_enc = (a != "create" and pre_enc_replay
                         and not enc_migration_seen
                         and ver and not _ver_lt(ver, ENCOUNTER_RULES_VERSION))
+        # 2.9.0 协作远征结构（coop_team 进入 run 状态/交接快照）：旧 create 形状
+        # 缺该字段，首个 2.9.0+ 动作之前先补 None（与在线 _migrate_state 对齐）。
+        crossing_coop = (a != "create" and pre_coop_replay
+                         and not coop_migration_seen
+                         and ver and not _ver_lt(ver, COOP_RULES_VERSION))
         # 受影响旧日志的修复点（2.4.0 跨章章号错位）：首个当前版本事件之前一切
         # 按 legacy 修复路径重放；越过该点后恢复严格校验。
         at_fix_point = (legacy_chapter and not post_fix and a != "create"
                         and (migrated_step or (ver and not _ver_lt(ver, RULES_VERSION))
                              or crossing_companion or crossing_potions
-                             or crossing_block or crossing_enc))
+                             or crossing_block or crossing_enc or crossing_coop))
         if (at_fix_point or crossing_companion or crossing_potions
-                or crossing_block or crossing_enc):
+                or crossing_block or crossing_enc or crossing_coop):
             if crossing_companion:
                 companion_migration_seen = True
                 sim.pop(_LEGACY_NO_COMPANION_KEY, None)
@@ -2368,6 +3014,9 @@ def replay(run_id):
             if crossing_enc:
                 enc_migration_seen = True
                 sim["enc_state"] = enc_mod.fresh_state()
+            if crossing_coop:
+                coop_migration_seen = True
+                sim.setdefault("coop_team", None)
             if crossing_block:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
@@ -2385,6 +3034,9 @@ def replay(run_id):
             if not enc_migration_seen:
                 enc_migration_seen = True
                 sim["enc_state"] = enc_mod.fresh_state()
+            if not coop_migration_seen:
+                coop_migration_seen = True
+                sim.setdefault("coop_team", None)
             if not block_rule_seen:
                 block_rule_seen = True
                 sim.pop(_LEGACY_BLOCK_KEY, None)
@@ -2401,6 +3053,8 @@ def replay(run_id):
                             and a != "create")
         pre_enc_step = (pre_enc_replay and not enc_migration_seen
                         and a != "create")
+        pre_coop_step = (pre_coop_replay and not coop_migration_seen
+                         and a != "create")
         # 仍处于旧格挡时序区间的步骤（2.7.0 修复点之前）：同一动作在旧时序下
         # 的落库状态与新推演不同（格挡/承伤/伙伴生命），按 legacy 呈现并跳过
         # 哈希比对；动作仍经 legacy_block 旧时序逐位重演。纯规则修复、无结构
@@ -2415,10 +3069,10 @@ def replay(run_id):
         is_legacy = not ver
         skip_ckpt = (corrupt_row or migrated_step or pre_repair
                      or create_of_legacy or pre_companion_step or pre_potions_step
-                     or pre_block_step or pre_enc_step)
+                     or pre_block_step or pre_enc_step or pre_coop_step)
         if (is_legacy or migrated_step or pre_repair or create_of_legacy
                 or pre_companion_step or pre_potions_step or pre_block_step
-                or pre_enc_step):
+                or pre_enc_step or pre_coop_step):
             legacy_steps += 1
         if pre_repair:
             repaired_steps += 1
@@ -2482,6 +3136,7 @@ def replay(run_id):
             include_companion=not pre_companion_step,
             include_potions=not pre_potions_step,
             include_encounters=not pre_enc_step,
+            include_coop=not pre_coop_step,
         )
         if error:
             status = "error"
@@ -2511,7 +3166,7 @@ def replay(run_id):
             "check": status,
             "legacy": (is_legacy or migrated_step or pre_repair
                        or create_of_legacy or pre_companion_step or pre_potions_step
-                       or pre_block_step or pre_enc_step),
+                       or pre_block_step or pre_enc_step or pre_coop_step),
             "migrated": migrated_step,
             "repaired": pre_repair,
             "error": error,
@@ -2802,11 +3457,13 @@ def _hand_public(run, bstate):
     return out
 
 
-def _public_view(run, map_data, run_id, include_unlocks=True, rev=None, expedition=None):
+def _public_view(run, map_data, run_id, include_unlocks=True, rev=None, expedition=None,
+                 coop=None):
     """只读视口。include_unlocks=False（回放）时不读取 profile 库，省略解锁信息。
 
     rev 非 None 时附带存档乐观版本号，客户端下次行动可作为 expected_rev 回传。
     expedition 非 None（远征章节 run）时附带远征摘要（章节进度/结算状态）。
+    coop 非 None（2.9.0 协作远征）时附带队伍摘要（成员/角色/本成员权限边界）。
     """
     reachable = map_data["routes"].get(run["position"], [])
     snap = None
@@ -2888,6 +3545,7 @@ def _public_view(run, map_data, run_id, include_unlocks=True, rev=None, expediti
         "map": _map_public(map_data, run["position"]),
         "unlocked_cards": get_profile_unlocked() if include_unlocks else None,
         "expedition": expedition,
+        "coop": coop,
         "truncated": bool(run["battle"]["truncated"]) if run["in_battle"] and run["battle"] else bool(run.get("truncated", False)),
     }
     if rev is not None:

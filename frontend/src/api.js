@@ -6,14 +6,35 @@ const BASE = '/api'
 //   服务端返回首次结果，不会重复扣款/发奖（双击/重复请求同理）
 let expectedRev = null
 
+// 多人协作远征（2.9.0）：当前队伍成员身份（入会响应里的 me.id）。协作章节 run
+// 的每个动作都带 member_id，服务端据此做角色权限边界（越权 403、零副作用）。
+let currentMemberId = null
+
 export function setExpectedRev(rev) {
   if (Number.isInteger(rev)) expectedRev = rev
+}
+
+export function setCurrentMemberId(id) {
+  currentMemberId = id || null
+}
+
+export function getCurrentMemberId() {
+  return currentMemberId
 }
 
 export class ConflictError extends Error {
   constructor(detail) {
     super(detail || '状态已变化，请刷新后重试')
     this.status = 409
+  }
+}
+
+// 协作权限边界：角色无权提交该动作（战斗位做资源动作/反之）。不自动重试，
+// 由调用方提示——这是明确的 403 而非并发冲突，刷新视口也不会改变授权结果。
+export class ForbiddenError extends Error {
+  constructor(detail) {
+    super(detail || '你的角色无权执行该操作')
+    this.status = 403
   }
 }
 
@@ -34,6 +55,7 @@ async function j(url, opts) {
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     if (res.status === 409) throw new ConflictError(data.detail)
+    if (res.status === 403) throw new ForbiddenError(data.detail)
     throw new Error(data.detail || `HTTP ${res.status}`)
   }
   return data
@@ -47,7 +69,7 @@ export const api = {
     return data
   },
   async resume(id) {
-    const data = await j(`${BASE}/runs/${id}/resume`)
+    const data = await j(`${BASE}/runs/${id}/resume${currentMemberId ? `?member_id=${encodeURIComponent(currentMemberId)}` : ''}`)
     setExpectedRev(data.rev)
     return data
   },
@@ -83,6 +105,8 @@ export const api = {
     // retryKey：调用方在“重试同一个意图”时显式传入；缺省每个调用一个新令牌
     const requestId = retryKey || newRequestId()
     const body = { ...action, request_id: requestId }
+    // 协作远征：动作带成员身份（普通局/单人远征服务端忽略该字段）
+    if (currentMemberId) body.member_id = currentMemberId
     if (expectedRev !== null) body.expected_rev = expectedRev
     try {
       const data = await j(`${BASE}/runs/${id}/act`, { method: 'POST', body: JSON.stringify(body) })
@@ -94,10 +118,65 @@ export const api = {
       throw e
     }
   },
+
+  // ---------- 多人协作远征（2.9.0） ----------
+  createCoopTeam: ({ name, captainName, seed, chapters }) =>
+    j(`${BASE}/coop/teams`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: name || null,
+        captain_name: captainName || null,
+        seed: seed ?? null,
+        chapters: chapters ?? null,
+      }),
+    }),
+  joinCoopTeam: (code, memberName, { retryKey } = {}) =>
+    j(`${BASE}/coop/teams/join`, {
+      method: 'POST',
+      body: JSON.stringify({
+        code,
+        member_name: memberName || null,
+        request_id: retryKey || newRequestId(),
+      }),
+    }),
+  getCoopTeam: (teamId, memberId = currentMemberId) =>
+    j(`${BASE}/coop/teams/${teamId}${memberId ? `?member_id=${encodeURIComponent(memberId)}` : ''}`),
+  assignRole: (teamId, targetId, role, { retryKey } = {}) =>
+    j(`${BASE}/coop/teams/${teamId}/roles`, {
+      method: 'POST',
+      body: JSON.stringify({
+        member_id: currentMemberId, target_id: targetId, role,
+        request_id: retryKey || newRequestId(),
+      }),
+    }),
+  leaveCoopTeam: (teamId, { retryKey } = {}) =>
+    j(`${BASE}/coop/teams/${teamId}/leave`, {
+      method: 'POST',
+      body: JSON.stringify({ member_id: currentMemberId, request_id: retryKey || newRequestId() }),
+    }),
+  disbandCoopTeam: (teamId, { retryKey } = {}) =>
+    j(`${BASE}/coop/teams/${teamId}/disband`, {
+      method: 'POST',
+      body: JSON.stringify({ member_id: currentMemberId, request_id: retryKey || newRequestId() }),
+    }),
+  startCoopExpedition: (teamId, { retryKey } = {}) =>
+    j(`${BASE}/coop/teams/${teamId}/start`, {
+      method: 'POST',
+      body: JSON.stringify({ member_id: currentMemberId, request_id: retryKey || newRequestId() }),
+    }),
+  advanceCoopExpedition: (teamId, { retryKey } = {}) =>
+    j(`${BASE}/coop/teams/${teamId}/advance`, {
+      method: 'POST',
+      body: JSON.stringify({ member_id: currentMemberId, request_id: retryKey || newRequestId() }),
+    }),
+  getCoopExpedition: (teamId, memberId = currentMemberId) =>
+    j(`${BASE}/coop/teams/${teamId}/expedition${memberId ? `?member_id=${encodeURIComponent(memberId)}` : ''}`),
+  coopTeamReplay: (teamId) => j(`${BASE}/coop/teams/${teamId}/replay`),
 }
 
 // 统一的行动错误处理：遇到 409（重复请求/状态冲突）自动拉取最新视口对齐，
 // 返回可展示给用户的提示语。refresh 为最新视口应用函数（通常是 applyRun）。
+// 403（协作权限边界）不刷新——刷新不会改变角色授权，直接把原因返回给调用方。
 export async function handleActError(e, runId, refresh) {
   if (e instanceof ConflictError) {
     try {

@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoSupply } from '../coopPerms'
 import PotionBelt from './PotionBelt.jsx'
 
 const TYPE_LABEL = { attack: '攻击', skill: '技能', power: '能力' }
@@ -20,6 +21,8 @@ export default function ShopView({ view, onClose }) {
   const shop = view.shop
   const removeCost = shop?.remove?.cost ?? 0
   const canRemoveAfford = view.gold >= removeCost
+  // 协作远征：买卖/移除都是资源动作（战斗位进店只读）
+  const supplyAllowed = canDoSupply(view)
 
   const deck = useMemo(
     () => (view.deck || []).map((d) => ({ ...d, meta: cardMeta(d.id) })),
@@ -76,6 +79,9 @@ export default function ShopView({ view, onClose }) {
       <div className="shopcard panel">
         <h2>🛒 旅途商店</h2>
         <p className="shopgold">金币 <b>{view.gold}</b></p>
+        {!supplyAllowed && (
+          <p className="comm-hint coop-deny">🔒 你是战斗位：商店交易由 🎒 资源位/队长操作，你可以浏览库存。</p>
+        )}
 
         <h3 className="shopsection">卡牌</h3>
         <div className="shoplist">
@@ -85,7 +91,7 @@ export default function ShopView({ view, onClose }) {
               key={it.sku}
               className={`shopitem ${it.tier} ${it.sold ? 'sold' : ''}`}
               onClick={() => !it.sold && buy('card', it.sku)}
-              disabled={it.sold || busy || view.gold < it.price}
+              disabled={it.sold || busy || !supplyAllowed || view.gold < it.price}
               title={it.desc}
             >
               <span className="siname">
@@ -106,7 +112,7 @@ export default function ShopView({ view, onClose }) {
               key={it.sku}
               className={`shopitem relic ${it.sold ? 'sold' : ''}`}
               onClick={() => !it.sold && buy('relic', it.sku)}
-              disabled={it.sold || busy || view.gold < it.price}
+              disabled={it.sold || busy || !supplyAllowed || view.gold < it.price}
               title={it.desc}
             >
               <span className="siname">📿 {it.name}</span>
@@ -126,7 +132,7 @@ export default function ShopView({ view, onClose }) {
               key={it.sku}
               className={`shopitem companion ${it.sold ? 'sold' : ''}`}
               onClick={() => !it.sold && buy('companion', it.sku)}
-              disabled={it.sold || busy || view.gold < it.price}
+              disabled={it.sold || busy || !supplyAllowed || view.gold < it.price}
               title={it.desc}
             >
               <span className="siname">
@@ -156,7 +162,7 @@ export default function ShopView({ view, onClose }) {
               key={it.sku}
               className={`shopitem potion ${it.sold ? 'sold' : ''}`}
               onClick={() => !it.sold && buyPotion(it.sku)}
-              disabled={it.sold || busy || view.gold < it.price}
+              disabled={it.sold || busy || !supplyAllowed || view.gold < it.price}
               title={it.desc}
             >
               <span className="siname">
@@ -186,9 +192,9 @@ export default function ShopView({ view, onClose }) {
                 <button
                   className="primary"
                   onClick={() => acceptCommission(o.sku)}
-                  disabled={busy}
+                  disabled={busy || !supplyAllowed}
                 >
-                  接取
+                  {supplyAllowed ? '接取' : '🔒 资源位'}
                 </button>
               </span>
             </span>
@@ -209,8 +215,8 @@ export default function ShopView({ view, onClose }) {
               <button
                 key={inst.uid}
                 className={`forgeinst ${c.tier} ${isSel ? 'sel' : ''}`}
-                onClick={() => setSelected(inst.uid)}
-                disabled={busy}
+                onClick={() => supplyAllowed && setSelected(inst.uid)}
+                disabled={busy || !supplyAllowed}
                 title={c.desc}
               >
                 <span className="cname">{c.name}</span>
@@ -222,7 +228,7 @@ export default function ShopView({ view, onClose }) {
         <button
           className="primary"
           onClick={() => transact({ action: 'shop_remove', card: selected })}
-          disabled={!selected || !canRemoveAfford || busy}
+          disabled={!selected || !canRemoveAfford || busy || !supplyAllowed}
         >
           移除选中卡牌（{removeCost} 金币）
         </button>

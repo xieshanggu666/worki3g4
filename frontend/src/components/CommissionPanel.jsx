@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoSupply } from '../coopPerms'
 
 const STATUS_LABEL = {
   active: '进行中',
@@ -25,6 +26,8 @@ export default function CommissionPanel() {
 
   const commissions = view?.commissions || []
   if (!view?.expedition || commissions.length === 0) return null
+  // 领奖是资源动作：协作远征里只有资源位/队长能领
+  const supplyAllowed = canDoSupply(view)
 
   // 终态（已领/失败）只保留最近若干条，避免侧栏越积越长
   const open = commissions.filter((q) => q.status === 'active' || q.status === 'ready')
@@ -47,7 +50,8 @@ export default function CommissionPanel() {
       <h3>📜 远征委托</h3>
       {open.map((q) => (
         <CommissionRow key={q.id} q={q} busy={busyId === q.id} onClaim={() => claim(q)}
-                       claimingLocked={!!view.in_battle} />
+                       claimingLocked={!!view.in_battle || !supplyAllowed}
+                       lockReason={!supplyAllowed ? '只有资源位/队长能领取委托' : null} />
       ))}
       {closed.length > 0 && (
         <div className="commissions-closed">
@@ -64,8 +68,9 @@ export default function CommissionPanel() {
   )
 }
 
-function CommissionRow({ q, busy, onClaim, claimingLocked }) {
+function CommissionRow({ q, busy, onClaim, claimingLocked, lockReason }) {
   const pct = Math.min(100, Math.round((q.progress / q.target) * 100))
+  const lockedHint = lockReason || '战斗结束后再领取'
   return (
     <div className={`commission ${q.status}`}>
       <div className="comm-head">
@@ -86,8 +91,8 @@ function CommissionRow({ q, busy, onClaim, claimingLocked }) {
       {q.can_claim && (
         <button className="primary comm-claim" onClick={onClaim}
                 disabled={busy || claimingLocked}
-                title={claimingLocked ? '战斗结束后再领取' : '领取委托奖励'}>
-          {busy ? '领取中…' : claimingLocked ? '战斗中暂不可领' : '🎁 领取奖励'}
+                title={claimingLocked ? lockedHint : '领取委托奖励'}>
+          {busy ? '领取中…' : claimingLocked ? (lockReason ? '非资源位不可领' : '战斗中暂不可领') : '🎁 领取奖励'}
         </button>
       )}
     </div>

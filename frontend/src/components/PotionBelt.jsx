@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoBattle, canDoSupply } from '../coopPerms'
 
 // 药水背包：可跨章携带的消耗品，限容量（view.potion_capacity）。
 // - 非战斗：每瓶可主动丢弃；背满时购买/领取新药水需选择被替换的格位
@@ -22,7 +23,10 @@ export default function PotionBelt({ inBattle = false, busy = false, onUsed = nu
   if (!view) return null
 
   const acting = busy || localBusy
+  // 协作远征：战斗中用药是战斗动作，非战斗丢弃是资源动作
   const canUseInBattle = inBattle && view.battle?.in_turn && !acting
+    && canDoBattle(view)
+  const canManage = !inBattle && canSupply(view)
 
   async function send(body) {
     setLocalBusy(true); setErr('')
@@ -45,7 +49,7 @@ export default function PotionBelt({ inBattle = false, busy = false, onUsed = nu
   }
 
   function discard(slot) {
-    if (inBattle || acting) return
+    if (inBattle || acting || !canManage) return
     return send({ action: 'discard_potion', slot })
   }
 
@@ -72,7 +76,7 @@ export default function PotionBelt({ inBattle = false, busy = false, onUsed = nu
                                             : canUseInBattle ? use(p.slot) : null)}>
             <span className="potion-icon">{p.icon}</span>
             <span className="potion-name">{p.name}</span>
-            {!replaceMode && !inBattle && (
+            {!replaceMode && !inBattle && canManage && (
               <button className="potion-drop" title="丢弃（不可恢复）"
                       disabled={acting}
                       onClick={(e) => { e.stopPropagation(); discard(p.slot) }}>

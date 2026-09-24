@@ -20,7 +20,8 @@ const FRAME_HOLD_MS = 650
 // 整局可交互回放：播放 / 暂停 / 上一步 / 下一步 / 拖拽跳转 / 倍速 / 时间轴。
 // 数据来自 GET /replay 的 steps（后端已逐步重建状态并校验），本组件只读展示。
 // embedded + replayData：由父组件（如远征整程回放）提供已加载的数据并去掉全屏外壳。
-export default function ReplayPlayer({ runId, onClose, embedded = false, replayData = null }) {
+export default function ReplayPlayer({ runId, onClose, embedded = false, replayData = null,
+                                       actorResolver = null }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [idx, setIdx] = useState(0)          // 当前帧下标（0..steps-1）
@@ -213,6 +214,18 @@ export default function ReplayPlayer({ runId, onClose, embedded = false, replayD
                 <span className="rc-seq">#{step?.seq}</span>
               </div>
               <div className="rc-title">{step?.title}</div>
+              {step?.actor && (
+                <div className="rc-actor" title={`本步操作者：${step.actor.name}（${step.actor.role_label || step.actor.role}）`}>
+                  👤 {step.actor.name}
+                  <em>{step.actor.role_label || step.actor.role}</em>
+                </div>
+              )}
+              {actorResolver && !step?.actor && step?.payload?.actor && (() => {
+                const who = actorResolver(step.payload.actor)
+                return who ? (
+                  <div className="rc-actor">👤 {who.name}<em>{who.role_label || who.role}</em></div>
+                ) : null
+              })()}
               {step?.summary && <div className="rc-summary">{step.summary}</div>}
               {step?.result && (
                 <div className={`rc-result ${step.result}`}>

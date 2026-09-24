@@ -83,6 +83,67 @@ CREATE TABLE IF NOT EXISTS expedition_events (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (exp_id, seq)
 );
+
+-- 多人协作远征（2.9.0）：队伍大厅。一支队伍绑定一支远征（start 后写 expedition_id）；
+-- join_code 为 6 位入队码（队长分发给队员），status: forming/started/disbanded
+CREATE TABLE IF NOT EXISTS coop_teams (
+    id TEXT PRIMARY KEY,
+    join_code TEXT NOT NULL UNIQUE,
+    name TEXT,
+    status TEXT NOT NULL,             -- forming / started / disbanded
+    leader_id TEXT NOT NULL,
+    seed INTEGER,
+    chapters_total INTEGER,
+    expedition_id TEXT,               -- 开赛后绑定的远征（forming 时为 NULL）
+    rev INTEGER NOT NULL DEFAULT 1,   -- 队伍乐观版本：角色调整/开赛 +1
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- 队伍成员：token 为该成员的入会令牌（客户端随管理/行动请求携带，做权限边界校验）
+CREATE TABLE IF NOT EXISTS coop_members (
+    id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,               -- leader / combat / supply
+    joined_seq INTEGER NOT NULL,      -- 入队序（确定性排序与均分余数）
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (id, team_id)
+);
+
+-- 队伍时间线事件（组队/入队/角色/开赛/推进/结算 + 个人战利 ledger），整程回放按序呈现
+CREATE TABLE IF NOT EXISTS coop_events (
+    team_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (team_id, seq)
+);
+
+-- 个人奖励/贡献流水：member_id 维度（战斗胜利/后勤操作/章节均分/终胜均分）
+CREATE TABLE IF NOT EXISTS coop_ledger (
+    team_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    member_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    amount INTEGER NOT NULL DEFAULT 0,
+    chapter INTEGER,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, seq)
+);
+
+-- 协作队伍管理动作的请求级幂等（入队/改角色/开赛/推进/退队/解散），
+-- 键空间与章节 run 的 act_requests 分开：run_id 列存 'coop:<team_id>'
+CREATE TABLE IF NOT EXISTS coop_requests (
+    team_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, request_id)
+);
 """
 
 
@@ -124,6 +185,10 @@ def init_db():
                 # 多章远征：章节 run 归属的远征与章节序号（普通局为 NULL）
                 conn.execute("ALTER TABLE runs ADD COLUMN expedition_id TEXT")
                 conn.execute("ALTER TABLE runs ADD COLUMN chapter INTEGER")
+            # 2.9.0：协作队伍归属（远征记录指向其队伍；单人远征为 NULL）
+            ecols = {r["name"] for r in conn.execute("PRAGMA table_info(expeditions)").fetchall()}
+            if "coop_team_id" not in ecols:
+                conn.execute("ALTER TABLE expeditions ADD COLUMN coop_team_id TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -327,22 +392,27 @@ def upsert_profile_conn(conn, unlocked_cards):
 
 
 # ---------- 多章远征 ----------
-def insert_expedition(conn, exp_id, seed, chapters_total, current_run_id, carry=None):
+def insert_expedition(conn, exp_id, seed, chapters_total, current_run_id, carry=None,
+                      coop_team_id=None):
     conn.execute(
         "INSERT INTO expeditions(id,seed,status,chapter,chapters_total,current_run_id,"
-        "carry_json,rev,created_at,updated_at) "
-        "VALUES(?,?,'in_progress',1,?,?,?,1,datetime('now'),datetime('now'))",
+        "carry_json,coop_team_id,rev,created_at,updated_at) "
+        "VALUES(?,?,'in_progress',1,?,?,?,?,1,datetime('now'),datetime('now'))",
         (exp_id, seed, chapters_total, current_run_id,
-         json.dumps(carry, ensure_ascii=False) if carry is not None else None),
+         json.dumps(carry, ensure_ascii=False) if carry is not None else None,
+         coop_team_id),
     )
 
 
 def _row_to_expedition(row):
+    keys = row.keys()
     return {
         "id": row["id"], "seed": row["seed"], "status": row["status"],
         "chapter": row["chapter"], "chapters_total": row["chapters_total"],
         "current_run_id": row["current_run_id"],
         "carry": json.loads(row["carry_json"]) if row["carry_json"] else None,
+        # 旧库迁移后才有该列；单人远征为 None
+        "coop_team_id": row["coop_team_id"] if "coop_team_id" in keys else None,
         "rev": row["rev"],
     }
 
@@ -447,3 +517,233 @@ def upsert_profile(unlocked_cards):
 class ConcurrentModification(Exception):
     """乐观版本号不匹配：存档在本请求处理期间被其它提交推进。"""
     pass
+
+
+# ---------- 多人协作远征（2.9.0） ----------
+def insert_coop_team_conn(conn, team_id, join_code, leader_id, name=None,
+                          seed=None, chapters_total=None):
+    conn.execute(
+        "INSERT INTO coop_teams(id,join_code,name,status,leader_id,seed,chapters_total,"
+        "expedition_id,rev,created_at,updated_at) "
+        "VALUES(?,?,?,'forming',?,?,?,NULL,1,datetime('now'),datetime('now'))",
+        (team_id, join_code, name, leader_id, seed, chapters_total),
+    )
+
+
+def insert_coop_member_conn(conn, member_id, team_id, token, name, role, joined_seq):
+    conn.execute(
+        "INSERT INTO coop_members(id,team_id,token,name,role,joined_seq,created_at) "
+        "VALUES(?,?,?,?,?,?,datetime('now'))",
+        (member_id, team_id, token, name, role, joined_seq),
+    )
+
+
+def _row_to_team(row):
+    return {
+        "id": row["id"], "join_code": row["join_code"], "name": row["name"],
+        "status": row["status"], "leader_id": row["leader_id"],
+        "seed": row["seed"], "chapters_total": row["chapters_total"],
+        "expedition_id": row["expedition_id"], "rev": row["rev"],
+    }
+
+
+def load_coop_team(team_id):
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        row = conn.execute("SELECT * FROM coop_teams WHERE id=?", (team_id,)).fetchone()
+    return None if row is None else _row_to_team(row)
+
+
+def load_coop_team_by_code_conn(conn, code):
+    row = conn.execute("SELECT * FROM coop_teams WHERE join_code=?", (code,)).fetchone()
+    return None if row is None else _row_to_team(row)
+
+
+def load_coop_team_conn(conn, team_id):
+    row = conn.execute("SELECT * FROM coop_teams WHERE id=?", (team_id,)).fetchone()
+    return None if row is None else _row_to_team(row)
+
+
+def list_coop_members_conn(conn, team_id):
+    rows = conn.execute(
+        "SELECT * FROM coop_members WHERE team_id=? ORDER BY joined_seq", (team_id,)
+    ).fetchall()
+    return [{"id": r["id"], "team_id": r["team_id"], "token": r["token"],
+             "name": r["name"], "role": r["role"], "joined_seq": r["joined_seq"]}
+            for r in rows]
+
+
+def get_coop_member_conn(conn, team_id, member_id):
+    row = conn.execute(
+        "SELECT * FROM coop_members WHERE team_id=? AND id=?", (team_id, member_id)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "team_id": row["team_id"], "token": row["token"],
+            "name": row["name"], "role": row["role"], "joined_seq": row["joined_seq"]}
+
+
+def get_coop_member_by_token_conn(conn, token):
+    """按入会令牌定位成员（跨队唯一）；查不到返回 None。"""
+    if not token:
+        return None
+    row = conn.execute("SELECT * FROM coop_members WHERE token=?", (token,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "team_id": row["team_id"], "token": row["token"],
+            "name": row["name"], "role": row["role"], "joined_seq": row["joined_seq"]}
+
+
+def update_coop_member_role_conn(conn, team_id, member_id, role):
+    cur = conn.execute(
+        "UPDATE coop_members SET role=? WHERE team_id=? AND id=?",
+        (role, team_id, member_id))
+    return cur.rowcount > 0
+
+
+def delete_coop_member_conn(conn, team_id, member_id):
+    cur = conn.execute(
+        "DELETE FROM coop_members WHERE team_id=? AND id=?", (team_id, member_id))
+    return cur.rowcount > 0
+
+
+def save_coop_team_conn(conn, team_id, status=None, leader_id=None, seed=None,
+                        chapters_total=None, expedition_id=None, name=None,
+                        expected_rev=None, bump_rev=True):
+    """更新队伍（只覆盖非 None 字段；开赛绑定远征时一次性写入）。
+
+    expected_rev 非 None 时做乐观检查；bump_rev=False 仅改非版本字段
+    （当前没有该场景，保留与远征更新同构的语义）。
+    """
+    cur = conn.execute("SELECT * FROM coop_teams WHERE id=?", (team_id,)).fetchone()
+    if cur is None:
+        raise ConcurrentModification(f"coop team {team_id} not found")
+    new_status = cur["status"] if status is None else status
+    new_leader = cur["leader_id"] if leader_id is None else leader_id
+    new_seed = cur["seed"] if seed is None else seed
+    new_chapters = cur["chapters_total"] if chapters_total is None else chapters_total
+    new_exp = cur["expedition_id"] if expedition_id is None else expedition_id
+    new_name = cur["name"] if name is None else name
+    rev_clause = "AND rev=?" if expected_rev is not None else ""
+    params = [new_status, new_leader, new_seed, new_chapters, new_exp, new_name, team_id]
+    if bump_rev:
+        sql = ("UPDATE coop_teams SET status=?, leader_id=?, seed=?, chapters_total=?, "
+               "expedition_id=?, name=?, rev=rev+1, updated_at=datetime('now') "
+               "WHERE id=? " + rev_clause)
+    else:
+        sql = ("UPDATE coop_teams SET status=?, leader_id=?, seed=?, chapters_total=?, "
+               "expedition_id=?, name=?, updated_at=datetime('now') "
+               "WHERE id=? " + rev_clause)
+    if expected_rev is not None:
+        params.append(expected_rev)
+    res = conn.execute(sql, params)
+    if res.rowcount == 0:
+        raise ConcurrentModification(
+            f"coop team {team_id} changed concurrently (rev {expected_rev})")
+
+
+def bind_expedition_to_team_conn(conn, team_id, expedition_id, seed, chapters_total,
+                                 expected_rev):
+    """开赛：forming -> started 并绑定远征（乐观版本守卫，原子）。"""
+    cur = conn.execute(
+        "UPDATE coop_teams SET status='started', expedition_id=?, seed=?, "
+        "chapters_total=?, rev=rev+1, updated_at=datetime('now') "
+        "WHERE id=? AND status='forming' AND rev=?",
+        (expedition_id, seed, chapters_total, team_id, expected_rev))
+    if cur.rowcount == 0:
+        raise ConcurrentModification(f"coop team {team_id} cannot start (rev/state)")
+
+
+def next_coop_seq_conn(conn, team_id):
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq),0) AS m FROM coop_events WHERE team_id=?", (team_id,)
+    ).fetchone()
+    return row["m"] + 1
+
+
+def append_coop_event_conn(conn, team_id, seq, kind, payload):
+    conn.execute(
+        "INSERT INTO coop_events(team_id,seq,kind,payload_json) VALUES(?,?,?,?)",
+        (team_id, seq, kind, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def load_coop_events(team_id):
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        rows = conn.execute(
+            "SELECT seq, kind, payload_json FROM coop_events WHERE team_id=? ORDER BY seq",
+            (team_id,)).fetchall()
+    out = []
+    for r in rows:
+        raw = r["payload_json"]
+        try:
+            payload = json.loads(raw) if raw is not None else {}
+        except (ValueError, TypeError):
+            payload = {"_corrupt": True}
+        if not isinstance(payload, dict):
+            payload = {"_corrupt": True}
+        out.append({"seq": r["seq"], "kind": r["kind"], "payload": payload})
+    return out
+
+
+def next_ledger_seq_conn(conn, team_id):
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq),0) AS m FROM coop_ledger WHERE team_id=?", (team_id,)
+    ).fetchone()
+    return row["m"] + 1
+
+
+def append_ledger_conn(conn, team_id, seq, member_id, kind, amount, chapter, payload):
+    conn.execute(
+        "INSERT INTO coop_ledger(team_id,seq,member_id,kind,amount,chapter,payload_json,"
+        "created_at) VALUES(?,?,?,?,?,?,?,datetime('now'))",
+        (team_id, seq, member_id, kind, amount, chapter,
+         json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def list_coop_ledger_conn(conn, team_id):
+    rows = conn.execute(
+        "SELECT seq, member_id, kind, amount, chapter, payload_json FROM coop_ledger "
+        "WHERE team_id=? ORDER BY seq", (team_id,)).fetchall()
+    out = []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload_json"])
+        except (ValueError, TypeError):
+            payload = {"_corrupt": True}
+        out.append({"seq": r["seq"], "member_id": r["member_id"], "kind": r["kind"],
+                    "amount": r["amount"], "chapter": r["chapter"], "payload": payload})
+    return out
+
+
+def list_all_join_codes_conn(conn):
+    """现存全部入队码（生成新码时去重；forming 与 started 的码都占命名空间）。"""
+    return {r["join_code"] for r in conn.execute("SELECT join_code FROM coop_teams").fetchall()}
+
+
+def get_coop_idempotent_conn(conn, team_id, request_id):
+    if not request_id:
+        return None
+    row = conn.execute(
+        "SELECT seq, response_json FROM coop_requests WHERE team_id=? AND request_id=?",
+        (team_id, request_id)).fetchone()
+    if row is None:
+        return None
+    return {"seq": row["seq"], "response": json.loads(row["response_json"])}
+
+
+def put_coop_idempotent_conn(conn, team_id, request_id, seq, response):
+    if not request_id:
+        return
+    conn.execute(
+        "INSERT INTO coop_requests(team_id,request_id,seq,response_json,created_at) "
+        "VALUES(?,?,?,?,datetime('now'))",
+        (team_id, request_id, seq, json.dumps(response, ensure_ascii=False)))

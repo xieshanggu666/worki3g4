@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoSupply } from '../coopPerms'
 
 export default function CompanionPanel() {
   const view = useStore((s) => s.view)
@@ -10,6 +11,7 @@ export default function CompanionPanel() {
   const [err, setErr] = useState('')
   const companion = view?.companion
   if (!companion) return null
+  const supplyAllowed = canDoSupply(view)
 
   async function setMode(mode) {
     if (busy) return
@@ -50,14 +52,16 @@ export default function CompanionPanel() {
             <button
               className="mini"
               onClick={() => setMode('accompany')}
-              disabled={busy || companion.mode === 'accompany'}
+              disabled={busy || companion.mode === 'accompany' || !supplyAllowed}
+              title={!supplyAllowed ? '只有资源位/队长能安排伙伴' : undefined}
             >
               随行
             </button>
             <button
               className="mini"
               onClick={() => setMode('rest')}
-              disabled={busy || companion.mode === 'rest'}
+              disabled={busy || companion.mode === 'rest' || !supplyAllowed}
+              title={!supplyAllowed ? '只有资源位/队长能安排伙伴' : undefined}
             >
               休整
             </button>

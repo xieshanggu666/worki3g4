@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoSupply } from '../coopPerms'
 import PotionBelt from './PotionBelt.jsx'
 
 function isPotionOption(o) {
@@ -17,8 +18,11 @@ export default function RewardView({ view }) {
   const applyRun = useStore((s) => s.applyRun)
 
   const beltFull = (view.potions || []).length >= (view.potion_capacity || 3)
+  // 协作远征：领取战后奖励是资源动作
+  const supplyAllowed = canDoSupply(view)
 
   async function claim(idx, replace) {
+    if (!supplyAllowed) return
     setBusy(true); setErr('')
     try {
       const body = { action: 'claim_reward', option: idx }
@@ -63,9 +67,13 @@ export default function RewardView({ view }) {
     <div className="overlay">
       <div className="rewardcard panel">
         <h2>选择奖励</h2>
+        {!supplyAllowed && (
+          <p className="comm-hint coop-deny">🔒 你是战斗位：战利品由 🎒 资源位/队长领取。</p>
+        )}
         <div className="rewardopts">
           {view.reward_options.map((o, i) => (
-            <button key={i} className="roption" onClick={() => pick(i, o)} disabled={busy} title={o.desc}>
+            <button key={i} className="roption" onClick={() => pick(i, o)}
+                    disabled={busy || !supplyAllowed} title={o.desc}>
               <span className="rkind">{o.name}</span>
               <span className="rdesc">
                 {o.desc}

@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, handleActError } from '../api'
 import { useStore } from '../store'
+import { canDoSupply } from '../coopPerms'
 import PotionBelt from './PotionBelt.jsx'
 
 // 跨章节奇遇抉择面板（规则 2.8.0）：进入「奇遇」节点后服务端挂起待抉择链，
@@ -16,8 +17,11 @@ export default function EncounterView({ view }) {
   const [replaceFor, setReplaceFor] = useState(null) // {chain, choice} 待选替换格
 
   if (!enc) return null
+  // 协作远征：奇遇抉择是资源动作（伏击战触发后由战斗位接手）
+  const supplyAllowed = canDoSupply(view)
 
   async function submit(chain, choice) {
+    if (!supplyAllowed) return
     setBusy(true); setErr('')
     try {
       const res = await api.act(runId, {
@@ -92,9 +96,12 @@ export default function EncounterView({ view }) {
           </div>
         ) : (
           <div className="enc-choices">
+            {!supplyAllowed && (
+              <p className="comm-hint coop-deny">🔒 你是战斗位：奇遇抉择由 🎒 资源位/队长做出（若触发伏击战将由你接手）。</p>
+            )}
             {enc.choices.map((ch) => (
               <button key={ch.id} className="enc-choice"
-                      onClick={() => onClick(ch)} disabled={busy}>
+                      onClick={() => onClick(ch)} disabled={busy || !supplyAllowed}>
                 <span className="enc-choice-label">{ch.label}</span>
                 <span className="enc-choice-desc">{ch.desc}</span>
               </button>
